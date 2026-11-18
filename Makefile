@@ -1,0 +1,12 @@
+export npm_config_cache := $(CURDIR)/.npm-cache
+.PHONY: deps migrate run test fmt
+deps:
+	pnpm install --frozen-lockfile --store-dir .pnpm-store
+migrate:
+	pnpm migrate
+run:
+	pnpm start
+test:
+	pnpm test
+fmt:
+	pnpm exec prettier --write src migrations test package.json tsconfig.json
