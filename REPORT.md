@@ -618,3 +618,136 @@ handler-service dependencies inside its handler Layer. The main remaining
 composition rough edge is the phantom HttpApi group identifier widening at a
 heterogeneous boundary; each group's endpoint schemas and handlers remain
 checked inside its own module.
+
+
+## Pass 4
+
+The existing black-box cases now run as TypeScript programs in Node. They use
+Effect HttpClient, independent wire schemas, typed assertion failures, and
+NodeRuntime. The housekeeping commit `b89ff5c` also includes the supplied
+PLAN.md and MIT LICENSE. The license contents were committed as supplied.
+
+### Verification
+
+- `make deps migrate test` passed **39 tests across four suites**, including
+  TypeScript checking. A second `make migrate` passed.
+- `data.ts` passed **15/15** with `PACKS=onboarding` and **15/15** with the
+  default packs. With default packs, `data-certs.ts` passed **6/6** and
+  `data-refs.ts` passed **7/7**, including 50 create-versus-delete races.
+- The reference-completeness property ran 100 generated registries and compared
+  exact issue paths for removing an attribute or a target shape. The replay
+  property ran 12 generated sequences, each with a guaranteed blocked delete
+  and clear cascade. After each action it compared live projections with an
+  independent model and history fold, and compared the SQL edges with those
+  recomputed from the projections. Saved states were replayed with `as_of`.
+- The API servers used for verification were stopped. The benchmark used the
+  dedicated `onb_data_bench` database.
+
+### Matched Store benchmark
+
+Both runs used the same script, Node 26.13.0 and PostgreSQL 17.11 on an Apple
+M2 Max with 32 GiB of RAM. The script bulk-seeded consistent projections,
+events, facts and clocks outside the timed intervals. It used 1,000,000
+entities in `bench_big` and 32 per account across 100 small accounts. The
+registry defined 200 mixed-type attributes. The shape initially included 199,
+with seven populated facts per entity. The timed apply attached the last
+attribute as optional and revalidated the million live entities.
+
+Each PATCH workload ran 16 workers with 50 warm-up and 250 measured writes
+per worker. Both versions patched the same sources and alternated the same
+two live target IDs per account. The baseline defined `bench/link` as a
+string. The refs run declared it as a ref targeting the benchmark shape and
+seeded its live edges. The application path for all measured operations was
+the Store. A PostgreSQL observer polled the advisory lock at 1 ms intervals
+to estimate lock hold time independently of application wall time. Each
+`as_of` fixture had 30 measured reads after warm-up.
+
+| Metric | Baseline | Refs |
+| --- | ---: | ---: |
+| PATCH one account (writes/s) | 1,801 | 1,717 |
+| PATCH one account p50 / p95 / p99 (ms) | 3.12 / 32.08 / 56.63 | 6.80 / 26.79 / 43.12 |
+| PATCH across 100 accounts (writes/s) | 3,102 | 2,824 |
+| PATCH across 100 accounts p50 / p95 / p99 (ms) | 4.54 / 8.15 / 9.37 | 4.98 / 9.08 / 13.28 |
+| Registry apply wall time (s) | 81.575 | 75.697 |
+| Registry apply exclusive lock (s) | 81.575 | 75.698 |
+| `as_of` with 10 history rows p50 / p95 / p99 (ms) | 0.132 / 0.232 / 0.251 | 0.124 / 0.192 / 0.218 |
+| `as_of` with 1,000 history rows p50 / p95 / p99 (ms) | 1.510 / 2.084 / 2.860 | 1.484 / 1.913 / 2.707 |
+| `as_of` with 10,000 history rows p50 / p95 / p99 (ms) | 15.743 / 45.191 / 46.436 | 13.072 / 13.867 / 14.735 |
+
+PATCH throughput fell 4.7% on one busy account and 8.9%
+when spread across 100 accounts. Both benchmark registries reached version 2
+with 200 attributes in the shape and identical big-account transaction
+counts. The refs run had 1,003,200 live edges, one per seeded entity.
+The normal `onb_data` database had zero benchmark registries.
+[Baseline results](bench/results-baseline.json) · [Refs results](bench/results-refs.json)
+
+These are single runs with sparse facts and local database traffic. The lock
+estimate can differ from wall time by a sampling interval. Registry apply
+materializes live documents and still performs per-entity uniqueness work
+under the exclusive account lock. The unchanged history replay path makes the
+observed `as_of` differences a useful indication of run-to-run variability.
+
+### How refs fit the primitives
+
+The existing Kind protocol resolves the attribute's target shape and reports
+declaration issues. The entity ID pattern revives through Effect's built-in
+pattern reviver and appears in exported JSON Schema. The existing typed-rule
+checks already reject ordering, substring operators and `ignore_case` for
+the new type. They reuse the value decoder for operands. The `set` op keeps
+its schema and instruction, and live uniqueness uses the existing index path.
+
+The configuration reference checker can resolve a shape name. Entity
+integrity also needs an account-scoped live lookup, a transaction lock and an
+indexed reverse projection. The compiled `edges` map carries the target
+shape and delete policy into storage. Storage validates those relationships
+on create, PATCH and each automation set. It uses `FOR KEY SHARE` for target
+rows, `FOR NO KEY UPDATE` for mutation sources, and `FOR UPDATE` for deletes,
+under shared account locks. PostgreSQL deadlock victims retry the write
+transaction with bounded backoff. A clear rechecks the fact after acquiring
+the referrer's row lock and stages a later transaction for each retraction.
+The fact and edge changes commit together. History and `as_of` still read
+the original events and facts.
+
+A generic extension for further relationship types would need a descriptor
+for live destination identity, transaction-time validation and locking,
+inverse lookup, and actions on delete or registry migration. This pass uses
+one descriptor and one interpreter for the two supported delete policies.
+
+### Source size
+
+Physical lines at the checked-in Prettier width, including imports, comments
+and blank lines.
+
+| Core file | Before | After | Net |
+| --- | ---: | ---: | ---: |
+| `model.ts` | 89 | 91 | +2 |
+| `values.ts` | 36 | 37 | +1 |
+| `kinds.ts` | 135 | 155 | +20 |
+| `rules.ts` | 170 | 170 | 0 |
+| `engine.ts` | 168 | 183 | +15 |
+| `registry.ts` | 13 | 13 | 0 |
+| **Core total** | **611** | **649** | **+38** |
+
+Core is **42 lines below** the +80 target. Non-test `src/` is **1,880 lines**
+against the original 1,200-line target, up from 1,683. The increase consists
+of 38 core lines, 142 storage lines, 14 HTTP lines and three migration-wiring
+lines. Storage carries the target locks, edge reconciliation and ordered
+cascade work.
+
+### Files touched outside core
+
+| Files | Change |
+| --- | --- |
+| `PLAN.md`, `LICENSE` | Commit the supplied pass plan and MIT license in the housekeeping commit. |
+| `README.md` | Document the converted conformance commands, ref behavior and benchmark setup. |
+| `conformance/data.mjs`, `conformance/data-certs.mjs` | Replaced by TypeScript suites. |
+| `conformance/data.ts`, `conformance/data-certs.ts` | Port the existing cases and assertions. |
+| `conformance/client.ts` | Share the external Effect client, wire decoders and typed runner. |
+| `conformance/data-refs.ts` | Exercise the wire contract, rollback, replay and the 50-attempt race. |
+| `test/core.test.ts`, `test/storage.test.ts` | Extend declaration, rule, value, impact and generated replay coverage. |
+| `migrations/0003_live_refs.ts`, `src/Migrations.ts` | Add and register the edge table, reverse index and history reason. |
+| `src/storage/Store.ts`, `src/storage/liveRefs.ts` | Validate target rows, project edges, reconcile registry changes and interpret delete policy transactionally. |
+| `src/http/handler.ts` | Expose referrers and describe the new history reason. |
+| `bench/run.ts`, `bench/results-baseline.json`, `bench/results-refs.json` | Deterministic fixture, Store workloads and measured outputs. |
+| `Makefile`, `package.json`, `tsconfig.json`, `.gitignore` | Wire benchmark, format and type-check commands, and ignore smoke outputs. |
+| `REPORT.md` | Record the measured comparison and verification. |
