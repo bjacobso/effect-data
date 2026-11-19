@@ -48,13 +48,19 @@ export function liveRefs(sql: SqlClient.SqlClient) {
         WHERE account_id=${account} AND entity_id=${entity.id} AND attribute IN ${sql.in(removed)}`;
       if (rows[0]) yield* insert([rows[0], ...rows.slice(1)]);
     });
-  const incoming = (account: string, target: string, edges: Edges) =>
-    sql<Incoming>`SELECT entity_id,attribute FROM live_refs WHERE account_id=${account} AND target_id=${target}
-      ORDER BY entity_id COLLATE "C", attribute`.pipe(
-      Effect.map((rows) => rows.map((row) => ({ ...row, on_delete: edges.get(row.attribute)!.on_delete }))),
+  const incoming = (account: string, target: string, compiled: Compiled) =>
+    sql<Incoming & { shape: string }>`SELECT r.entity_id,r.attribute,e.document::jsonb->>'shape' AS shape
+      FROM live_refs r JOIN entities e ON e.account_id=r.account_id AND e.id=r.entity_id
+      WHERE r.account_id=${account} AND r.target_id=${target} AND NOT e.deleted
+      ORDER BY r.entity_id COLLATE "C", r.attribute`.pipe(
+      Effect.map((rows) =>
+        rows.flatMap(({ shape, ...row }) => {
+          const edge = compiled.edges.get(row.attribute);
+          return edge && compiled.members.get(shape)?.has(row.attribute) ? [{ ...row, on_delete: edge.on_delete }] : [];
+        }),
+      ),
     );
-  // Called under apply's exclusive account lock, after validating desired facts
-  // and removing outgoing edges for facts dropped from their shapes.
+  // Called under apply's exclusive account lock, for stored facts of any shape.
   const reconcile = (account: string, previous: Edges, desired: Edges, entities: Iterable<Entity>) =>
     Effect.gen(function* () {
       const removed = [...previous.keys()].filter((key) => !desired.has(key));

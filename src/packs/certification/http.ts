@@ -52,9 +52,8 @@ export const CertificationHttpLive = HttpApiBuilder.group(api, "certification", 
         Effect.gen(function* () {
           const t = yield* Tenant,
             id = yield* entityId(params.id),
-            entity = yield* store.getLive(t.account, id),
-            r = yield* store.getRegistry(t.account);
-          return certifications(r.registry, entity, payload.on, store.compiled(t.account, r.version, r.registry));
+            { entity, registry, config } = yield* store.readEntity(t.account, id);
+          return certifications(registry, entity, payload.on, config);
         }),
       ),
     );

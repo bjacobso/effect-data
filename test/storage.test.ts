@@ -242,20 +242,14 @@ test("failed automation rolls back facts, projection, and outbox; logs reject mu
   expect(held).toHaveLength(1);
 });
 
-test("migration and deletion replay old state, pagination crosses decimal boundaries", async () => {
+test("soft removal and deletion replay old state, pagination crosses decimal boundaries", async () => {
   const a = await seed(),
     e = await run(store.mutate(a, "test", { shape: "employee", facts: { "person/email": "a", "person/note": "history" } }));
   const desired = fixture();
-  desired.attributes = desired.attributes!.filter((a) => a.key !== "person/note");
   desired.shapes![0]!.attributes = desired.shapes![0]!.attributes.filter((k: string) => k !== "person/note");
   await run(store.apply(a, "admin", desired, 1));
-  expect((await run(store.getLive(a, e.id))).registry_version).toBe(2);
-  expect((await run(store.history(a, e.id))).data.at(-1)).toMatchObject({
-    reason: "migration",
-    actor: "admin",
-    op: "retract",
-    value: "history",
-  });
+  expect(await run(store.getLive(a, e.id))).toMatchObject({ registry_version: 1, facts: { "person/email": "a" } });
+  expect((await run(store.history(a, e.id))).data.every((fact) => fact.reason !== "migration")).toBe(true);
   expect((await run(store.asOf(a, e.id, e.updated_at))).facts).toEqual(e.facts);
   for (let i = 0; i < 15; i++) await run(store.mutate(a, "test", { facts: { "employee/state": i % 2 ? "CA" : "CO" } }, e.id));
   let after = 0;
@@ -389,7 +383,7 @@ const seedDistinctBatch = async (count: number) => {
       SELECT account_id,entity_id,jsonb_build_object('id',entity_id,'shape',shape,'version',version,
         'registry_version',registry_version,'created_at',created_at,'updated_at',at,
         'facts',jsonb_build_object(${attribute}::text,tx))::text FROM events WHERE account_id=${a}`;
-        yield* sql`INSERT INTO account_clocks VALUES (${a},${count},${Date.UTC(2024, 0, 1) + count})`;
+        yield* sql`UPDATE account_clocks SET tx=${count} WHERE account_id=${a}`;
       }),
     ),
   );
@@ -397,23 +391,20 @@ const seedDistinctBatch = async (count: number) => {
   return { a, initial, attribute };
 };
 
-test("apply commits migration retractions across PostgreSQL bind batches", async () => {
+test("soft removal leaves every stored projection and fact intact", async () => {
   const count = 10_000;
   const { a, initial, attribute } = await seedDistinctBatch(count);
   const applied = await run(store.apply(a, "admin", { ...initial, shapes: [{ key: "batch", attributes: ["batch/keep"] }] }, 1));
   expect(applied.version).toBe(2);
   const entities = await run(store.live(a));
   expect(entities).toHaveLength(count);
-  expect(entities.every((e) => e.registry_version === 2 && e.version === 2 && Object.keys(e.facts).length === 0)).toBe(true);
-  const [migration] = await run(
-    store.sql<{ count: string }>`SELECT count(*)::text FROM facts WHERE account_id=${a} AND reason='migration'`,
-  );
-  expect(Number(migration!.count)).toBe(count);
+  expect(entities.every((e) => e.registry_version === 1 && e.version === 1 && attribute in e.facts)).toBe(true);
+  const [hiddenAt] = await run(store.sql<{ at: string }>`SELECT at FROM registry_versions WHERE account_id=${a} AND version=2`);
   for (const e of [entities[0]!, entities.at(-1)!]) {
-    const [created, retracted] = (await run(store.history(a, e.id))).data;
-    expect(retracted).toMatchObject({ op: "retract", attribute, value: created!.value, actor: "admin", reason: "migration" });
-    expect((await run(store.asOf(a, e.id, created!.at))).facts).toEqual({ [attribute]: created!.value });
-    expect(await run(store.asOf(a, e.id, retracted!.at))).toEqual(e);
+    expect((await run(store.history(a, e.id))).data).toHaveLength(1);
+    expect((await run(store.asOf(a, e.id, e.updated_at))).facts).toEqual(e.facts);
+    expect((await run(store.asOf(a, e.id, hiddenAt!.at))).facts).toEqual({});
+    expect((await run(store.getLive(a, e.id))).facts).toEqual({});
   }
 }, 30000);
 
@@ -505,7 +496,7 @@ test("apply detects a deleted target referenced by an unchanged source during pr
   expect((await run(store.getRegistry(a))).version).toBe(1);
 });
 
-test("apply stages retractions from the post-snapshot version of an entity", async () => {
+test("soft removal preserves values written before and after the apply", async () => {
   const a = account();
   const initial = {
     attributes: [
@@ -518,13 +509,13 @@ test("apply stages retractions from the post-snapshot version of an entity", asy
   const desired = { ...initial, shapes: [{ key: "item", attributes: ["test/keep"] }] };
   await run(store.apply(a, "test", initial, 0));
   const e = await run(store.mutate(a, "test", { shape: "item", facts: { "test/drop": 1, "test/keep": 2 } }));
-  await duringPreflight(store.apply(a, "admin", desired, 1), () =>
-    run(store.mutate(a, "writer", { facts: { "test/drop": 3, "test/keep": 4 } }, e.id)),
-  );
-  const current = await run(store.getLive(a, e.id));
+  await run(store.mutate(a, "writer", { facts: { "test/drop": 3 } }, e.id));
+  await run(store.apply(a, "admin", desired, 1));
+  const current = await run(store.mutate(a, "writer", { facts: { "test/keep": 4 } }, e.id));
   expect(current).toMatchObject({ facts: { "test/keep": 4 }, version: 3, registry_version: 2 });
-  expect((await run(store.history(a, e.id))).data.at(-1)).toMatchObject({ op: "retract", value: 3, reason: "migration" });
-  expect(await run(store.asOf(a, e.id, current.updated_at))).toEqual(current);
+  expect((await run(store.asOf(a, e.id, current.updated_at))).facts).toEqual(current.facts);
+  await run(store.apply(a, "admin", initial, 2));
+  expect((await run(store.getLive(a, e.id))).facts).toEqual({ "test/drop": 3, "test/keep": 4 });
 });
 
 test("a replacement store continues the database clock", async () => {

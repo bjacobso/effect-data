@@ -10,7 +10,7 @@ the behaviour it describes.
   and this file must be brought back into agreement; PLAN.md is not edited
   after its pass lands.
 
-Status: through **Pass 5** (registry apply performance). Packs: `onboarding`,
+Status: through **Pass 6, soft removal**. Packs: `onboarding`,
 `certification`.
 
 ## 1. Model
@@ -47,7 +47,7 @@ certification_requirements (35, certification), automations (40).
 ### 2.2 Core kinds
 
 **Attribute**
-`{ key, type, values?, label?, unique?, target?, on_delete? }`
+`{ key, type, values?, label?, unique?, retired?, target?, on_delete? }`
 
 | Field | Rule |
 | --- | --- |
@@ -56,6 +56,7 @@ certification_requirements (35, certification), automations (40).
 | `values` | enum only, required for enum: 1–100 unique strings of 1–200 code points |
 | `label` | 1–200 code points |
 | `unique` | boolean; uniqueness spans live entities of every shape |
+| `retired` | optional literal `true`; unavailable to shapes, rules and actions |
 | `target` | ref only, required for ref: a shape key (a reference) |
 | `on_delete` | ref only, optional: `block` (default when absent) or `clear` |
 
@@ -127,8 +128,12 @@ Issues are ordered by kind order, then index, then the kind's field order.
   entity id, then field.
 - `PUT /v2/registry` requires `base_version`: stale → 409; issues → 422;
   violations → 409 with details `<entity_id>.<field>`; otherwise 200. Apply
-  retracts facts for attributes removed from a live entity's shape, with
-  reason `migration`.
+  hides facts for attributes removed from a live entity's shape. Putting a
+  member back restores its facts. Apply releases hidden unique slots before
+  claiming new slots, all within the registry transaction.
+- Every previously applied attribute key must remain in the document. Omission
+  is a 422 issue at `attributes` naming the key. Retiring and unretiring an
+  attribute preserve the rest of its definition. A retired definition is frozen.
 - Plan and apply select entities and facts affected by registry changes for
   revalidation. Apply prepares these checks from a committed snapshot before
   taking the account's exclusive lock. Under the lock it checks the registry
@@ -156,6 +161,10 @@ effect-data specifics:
   "created_at": "…Z", "updated_at": "…Z", "effects": [] }
 ```
 
+- Visible facts are stored facts belonging to the entity's shape under the
+  registry being read. Current reads, pack routes, rules and automations use
+  the current registry. Entity version and registry version describe the last
+  entity write. PATCH preserves hidden values and rejects writes to their keys.
 - **Create** `POST /v2/entities` `{ shape, facts }` → 201 with `Location`.
   Facts must be attributes of the shape and decode; required attributes must
   be present; `null` equals absent. Unknown shape → 422 at `shape`.
@@ -165,12 +174,14 @@ effect-data specifics:
   written.
 - **Read** `GET /v2/entities/{id}` with optional `?as_of=<RFC 3339>`. 404 if
   the entity does not exist (or did not exist yet / was deleted at `as_of`).
+  Historical reads use the registry in effect at the requested time. Before
+  the earliest recorded registry version, replay returns all historical facts.
 - **Delete** `DELETE /v2/entities/{id}` → 204. Later reads 404; `as_of` before
   the deletion still works; its unique values are freed. See 5.3 for refs.
 - **History** `GET /v2/entities/{id}/history` → `{ data: [{ tx, at,
   attribute, op, value, reason, actor }] }` ordered by tx then attribute.
   `reason` is `api | automation | migration | reference`. Readable after
-  deletion.
+  deletion. Registry applies add no history rows.
 - Unique collisions with any live entity of any shape → 409 at
   `facts.<key>`.
 
@@ -203,6 +214,9 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
 3. Clears never trigger automations and never delete further.
 
 ### 5.4 Impact and history
+
+Hidden refs are excluded from delete blocking, clearing and referrer listings.
+An apply that restores a ref checks its target against live entities.
 
 - `GET /v2/entities/{id}/referrers` → `{ data: [{ entity_id, attribute,
   on_delete }] }` for live referrers, sorted by entity id then attribute; 404
@@ -272,6 +286,11 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
 - `facts` and `events` are append-only (triggers reject UPDATE and DELETE).
   `entities`, `live_unique` and `live_refs` are projections updated in the
   same transaction as the facts.
+- Registry versions are recorded on apply. The registry-history migration
+  captures the current document for existing accounts at backfill time.
+- `live_refs` projects stored ref facts, including hidden values, using the
+  attribute's current type. Type changes add or remove these rows under the
+  exclusive account lock. Hidden refs can point to deleted targets.
 - Each account has its own `tx` sequence and logical clock; one API write is
   one tx, and each automation `set` or reference clear is a later tx in the
   same database transaction.
@@ -282,8 +301,8 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
   lock guards changes to the live uniqueness projection.
 - Known limits, measured in REPORT.md Pass 5 at 1M live entities: attaching
   an optional member held the exclusive account lock for 2.21 ms, enabling
-  uniqueness for 37.47 s and retracting a populated member for 118.36 s. The
-  lock blocks all writes to that account. `as_of` replays an entity's full
+  uniqueness for 37.47 s. Apply now preserves the stored values of removed
+  members. The exclusive lock blocks all writes to that account. `as_of` replays an entity's full
   history.
 
 ## 10. Composition

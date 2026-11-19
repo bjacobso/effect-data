@@ -55,6 +55,7 @@ export const AttributeSchema = Schema.Struct({
   values: Schema.optionalKey(list(text(1, 200), 1, 100)),
   label: Schema.optionalKey(text(1, 200)),
   unique: Schema.optionalKey(Schema.Boolean),
+  retired: Schema.optionalKey(Schema.Literal(true)),
   target: Schema.optionalKey(shapeKey),
   on_delete: Schema.optionalKey(Schema.Literals(["block", "clear"])),
 });
@@ -63,7 +64,7 @@ export const attributeKind = defineKind(AttributeSchema, {
   collection: "attributes",
   identity: "key",
   order: 10,
-  fields: ["key", "type", "values", "label", "unique", "target", "on_delete"],
+  fields: ["key", "type", "values", "label", "unique", "retired", "target", "on_delete"],
   references: (d) => (d.type === "ref" && d.target !== undefined ? [{ path: "target", to: "shape", key: d.target }] : []),
   check: () => [],
   structure: (d) => {

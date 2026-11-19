@@ -635,7 +635,7 @@ test(
 );
 
 test(
-  "registry evolution: violations, 409, migration retracts",
+  "registry evolution: violations, 409, soft removal",
   Effect.gen(function* () {
     const a = newAccount();
     yield* putOk(a, 0, { ...REGISTRY, automations: [] });
@@ -674,12 +674,11 @@ test(
     yield* eqJ((yield* p.body).applicable, false, "not applicable");
     const e = yield* expectError(yield* put(a, 1, desired), 409, "conflict", "PUT with violations");
     yield* same(fieldsOf(e).sort(), expected.map((v) => `${v.entity_id}.${v.field}`).sort(), "PUT details");
-    // Removing an attribute from the shape retracts its facts, audited as migration.
+    // Removing attributes from the shape hides their facts without editing history.
     const shrink = {
       ...REGISTRY,
       automations: [],
       policies: REGISTRY.policies.filter((x) => x.id !== "high-earner"),
-      attributes: ATTRS.filter((x) => x.key !== "employee/level" && x.key !== "employee/salary"),
       shapes: [
         { ...EMPLOYEE, attributes: EMPLOYEE.attributes.filter((k) => k !== "employee/level" && k !== "employee/salary") },
         CONTRACTOR,
@@ -695,17 +694,12 @@ test(
     yield* eqJ(r.version, 2, "applied");
     const g = yield* req(Entity, "GET", `/v2/entities/${e2.id}`, { account: a });
     yield* same((yield* g.body).facts, { "person/email": "b@x.co", "person/nickname": "dup" }, "facts dropped");
-    yield* eqJ((yield* g.body).registry_version, 2, "registry_version follows the migration write");
+    yield* eqJ((yield* g.body).registry_version, 1, "registry_version follows the last entity write");
     const h = yield* req(History, "GET", `/v2/entities/${e2.id}/history`, { account: a });
     yield* eqJ(
-      (yield* h.body).data
-        .filter((x) => x.reason === "migration")
-        .map(({ attribute, op, value, actor }) => ({ attribute, op, value, actor })),
-      [
-        { attribute: "employee/level", op: "retract", value: 4, actor: "admin" },
-        { attribute: "employee/salary", op: "retract", value: 5, actor: "admin" },
-      ],
-      "migration retracts",
+      (yield* h.body).data.filter((x) => x.reason === "migration"),
+      [],
+      "no migration facts",
     );
     yield* eqJ(c.registry_version, 1, "sanity");
   }),

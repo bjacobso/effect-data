@@ -133,7 +133,6 @@ describe("registry pipeline", () => {
       desired = fixture();
     desired.automations = [];
     desired.policies = [];
-    desired.attributes = desired.attributes!.filter((a) => a.key !== "employee/state");
     desired.shapes![0]!.attributes = desired.shapes![0]!.attributes.filter((k: string) => k !== "employee/state");
     expect(app.plan(r, desired, [entity({ "person/email": "a", "employee/state": "CA" })]).applicable).toBe(true);
     desired.attributes![0]!.type = "integer";

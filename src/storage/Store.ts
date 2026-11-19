@@ -15,12 +15,11 @@ import {
   canonical,
   compare,
   findShape,
-  findAttribute,
   issue,
   decodeIssues,
 } from "../core/model.ts";
 import { merge } from "../core/engine.ts";
-import { registryImpact, type RegistryImpact } from "../core/registryImpact.ts";
+import { registryImpact, slotChanges, type RegistryImpact } from "../core/registryImpact.ts";
 import { registryReview } from "../core/registryReview.ts";
 import { ensure, ensureApplicable, NotFound, Conflict } from "../Errors.ts";
 // JSON text inside jsonb preserves NUL and lone surrogates.
@@ -122,7 +121,7 @@ export const makeStore = (hashOverride?: string) =>
         WHERE account_id=${account} AND tx>${position}::bigint
           AND shape IN ${sql.in([...new Set([...impact.shapes.keys(), ...impact.targets])])}) d
       JOIN entities e ON e.account_id=${account} AND e.id=d.entity_id`;
-    const getLive = (account: string, id: string, mode?: "write" | "delete" | "reference") =>
+    const getStored = (account: string, id: string, mode?: "write" | "delete" | "reference") =>
       Effect.gen(function* () {
         const locking =
           mode === "write"
@@ -137,6 +136,17 @@ export const makeStore = (hashOverride?: string) =>
         if (!rows[0]) return yield* Effect.fail(new NotFound());
         return JSON.parse(rows[0].document) as Entity;
       });
+    const readEntity = (account: string, id: string) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* lock(account);
+          const stored = yield* getStored(account, id);
+          const { version, registry } = yield* getRegistry(account);
+          const config = compiled(account, version, registry);
+          return { entity: { ...stored, facts: config.visible(stored.shape, stored.facts) }, registry, config };
+        }),
+      );
+    const getLive = (account: string, id: string) => readEntity(account, id).pipe(Effect.map(({ entity }) => entity));
     const insertUnique = (account: string, id: string, key: string, value: Value) =>
       Effect.gen(function* () {
         const encoded = encodeValue(value);
@@ -181,8 +191,7 @@ export const makeStore = (hashOverride?: string) =>
       account: string,
       before: Entity | undefined,
       entity: Entity,
-      registry: Registry,
-      edges: Compiled["edges"],
+      config: Compiled,
       actor: string,
       reason: string,
       kind = "write",
@@ -197,10 +206,10 @@ export const makeStore = (hashOverride?: string) =>
         probe?.phase("uniqueness");
         yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
         if (kind !== "delete")
-          for (const [key, value] of Object.entries(next.facts).sort(([a], [b]) => compare(a, b)))
-            if (findAttribute(registry, key)?.unique) yield* insertUnique(account, next.id, key, value);
+          for (const [key, value] of Object.entries(config.visible(next.shape, next.facts)).sort(([a], [b]) => compare(a, b)))
+            if (config.unique.has(key)) yield* insertUnique(account, next.id, key, value);
         probe?.phase("edge update");
-        if (edges.size) yield* refs.update(account, next, keys, edges);
+        if (config.edges.size) yield* refs.update(account, next, keys, config.edges);
         probe?.phase("staging and automations");
         steps.push({ entity: next, keys, before: before?.facts ?? {}, actor, reason, kind });
         return next;
@@ -277,7 +286,7 @@ export const makeStore = (hashOverride?: string) =>
           probe?.phase("account lock");
           yield* lock(account);
           probe?.phase("entity read");
-          const before = id ? yield* getLive(account, id, "write") : undefined;
+          const before = id ? yield* getStored(account, id, "write") : undefined;
           probe?.phase("registry read");
           const { version, registry } = yield* getRegistry(account);
           if (before && body.expected_version !== undefined && before.version !== body.expected_version)
@@ -289,7 +298,7 @@ export const makeStore = (hashOverride?: string) =>
           const unknown = Object.keys(body.facts)
             .filter((k) => !findShape(registry, shape)?.attributes.includes(k))
             .map((k) => issue(`facts.${k}`, "Unknown attribute"));
-          yield* ensure([...validate(c, shape, facts), ...(findShape(registry, shape) ? unknown : [])]);
+          yield* ensure([...validate(c, shape, c.visible(shape, facts)), ...(findShape(registry, shape) ? unknown : [])]);
           const steps: Step[] = [],
             deliveries: Delivery[] = [],
             effects: (Action & { automation_id: string })[] = [];
@@ -303,9 +312,9 @@ export const makeStore = (hashOverride?: string) =>
             updated_at: "",
           };
           probe?.phase("ref validation");
-          if (c.edges.size) yield* refs.validate(account, initial, c.edges);
+          if (c.edges.size) yield* refs.validate(account, { ...initial, facts: c.visible(shape, facts) }, c.edges);
           probe?.phase("staging");
-          let entity = yield* stage(steps, account, before, initial, registry, c.edges, actor, "api", before ? "write" : "create");
+          let entity = yield* stage(steps, account, before, initial, c, actor, "api", before ? "write" : "create");
           const changed = Object.keys({ ...before?.facts, ...facts }).filter(
             (k) => canonical(before?.facts[k] ?? null) !== canonical(facts[k] ?? null),
           );
@@ -314,7 +323,7 @@ export const makeStore = (hashOverride?: string) =>
             if (
               a.shape === shape &&
               candidates.has(a.id) &&
-              (a.when === undefined || c.rules.get(canonical(a.when))!(entity.facts) === "T")
+              (a.when === undefined || c.rules.get(canonical(a.when))!(c.visible(shape, entity.facts)) === "T")
             )
               for (const action of a.do) {
                 effects.push({ ...action, automation_id: a.id });
@@ -325,17 +334,17 @@ export const makeStore = (hashOverride?: string) =>
                     facts: merge(entity.facts, { [instruction.attribute]: instruction.value }),
                     registry_version: version,
                   };
-                  yield* ensure(validate(c, shape, updated.facts));
-                  if (c.edges.size) yield* refs.validate(account, updated, c.edges);
-                  entity = yield* stage(steps, account, entity, updated, registry, c.edges, `automation:${a.id}`, "automation");
+                  yield* ensure(validate(c, shape, c.visible(shape, updated.facts)));
+                  if (c.edges.size) yield* refs.validate(account, { ...updated, facts: c.visible(shape, updated.facts) }, c.edges);
+                  entity = yield* stage(steps, account, entity, updated, c, `automation:${a.id}`, "automation");
                 } else deliveries.push({ index: steps.length - 1, entity_id: entity.id, automation_id: a.id, action: instruction.payload });
               }
           const committed = yield* flush(account, steps, deliveries);
           probe?.phase("transaction completion");
-          return { ...(committed.get(entity.id) ?? entity), effects };
+          return { ...(committed.get(entity.id) ?? entity), facts: c.visible(shape, entity.facts), effects };
         }),
       );
-    const apply = (account: string, actor: string, desired: Registry, base: number) =>
+    const apply = (account: string, _actor: string, desired: Registry, base: number) =>
       Effect.gen(function* () {
         const probe = yield* StoreProbe;
         desired = app.normalize(desired);
@@ -352,13 +361,14 @@ export const makeStore = (hashOverride?: string) =>
               const previous = compiled(account, base, current.registry).edges;
               // The desired version is not committed yet, so keep it out of the cache.
               const edges = plan.issues.length ? previous : app.compile(desired).edges;
-              const previousUnique = new Set(current.registry.attributes.filter((a) => a.unique).map((a) => a.key));
-              const desiredUnique = new Set(desired.attributes.filter((a) => a.unique).map((a) => a.key));
-              const addedUnique = [...desiredUnique].filter((key) => !previousUnique.has(key)).sort(compare);
-              const removedUnique = [...previousUnique].filter((key) => !desiredUnique.has(key));
-              const addedEdges = [...edges.keys()].filter((key) => !previous.has(key));
-              const members = new Map(desired.shapes.map((s) => [s.key, new Set(s.attributes)]));
-              const steps = new Map<string, Step>();
+              const slots = slotChanges(current.registry, desired);
+              const addedEdges = current.registry.attributes.map((a) => a.key).filter((key) => edges.has(key) && !previous.has(key));
+              const reviewShapes = new Set(impact.shapes.keys());
+              if (addedEdges.length)
+                for (const shape of current.registry.shapes) {
+                  if (!impact.shapes.has(shape.key))
+                    impact.shapes.set(shape.key, { fields: new Set(), unique: new Set(), refs: new Set() });
+                }
               const edgeSources = new Map<string, Entity>();
               const uniqueSlots = new Map<string, UniqueSlot[]>();
 
@@ -366,35 +376,17 @@ export const makeStore = (hashOverride?: string) =>
                 if (impact.targets.has(row.shape)) review.setTarget(row.id, row.deleted ? undefined : row.shape);
                 if (!impact.shapes.has(row.shape)) return;
                 const e = row.document === null ? undefined : (JSON.parse(row.document) as Entity);
-                review.setEntity(row.id, e);
-                steps.delete(row.id);
+                if (reviewShapes.has(row.shape)) review.setEntity(row.id, e);
                 edgeSources.delete(row.id);
                 uniqueSlots.delete(row.id);
-                const accepted = e && members.get(e.shape);
-                if (!e || !accepted) return;
-                const keys = Object.keys(e.facts)
-                  .filter((key) => !accepted.has(key))
-                  .sort(compare);
-                let after = e;
-                if (keys.length) {
-                  const facts = { ...e.facts };
-                  for (const key of keys) delete facts[key];
-                  after = { ...e, facts, version: e.version + 1, registry_version: version };
-                  steps.set(row.id, { entity: after, keys, before: e.facts, actor, reason: "migration", kind: "write" });
-                }
-                if (addedEdges.some((key) => key in after.facts)) edgeSources.set(row.id, after);
-                if (addedUnique.length) {
-                  const slots = addedUnique
-                    .filter((key) => key in after.facts)
-                    .map((key) => ({
-                      entity_id: row.id,
-                      attribute: key,
-                      encoded: encodeValue(after.facts[key]),
-                    }));
-                  if (slots.length) uniqueSlots.set(row.id, slots);
-                }
+                if (!e) return;
+                if (addedEdges.some((key) => key in e.facts)) edgeSources.set(row.id, e);
+                const claims = slots
+                  .get(row.shape)
+                  ?.claim.filter((key) => key in e.facts)
+                  .map((key) => ({ entity_id: row.id, attribute: key, encoded: encodeValue(e.facts[key]) }));
+                if (claims?.length) uniqueSlots.set(row.id, claims);
               };
-
               let position: string | undefined;
               if (!plan.issues.length && impact.shapes.size) {
                 probe?.phase("snapshot position");
@@ -424,9 +416,7 @@ export const makeStore = (hashOverride?: string) =>
                 violations,
                 previous,
                 edges,
-                desiredUnique,
-                removedUnique,
-                steps,
+                slots,
                 edgeSources,
                 uniqueSlots,
               };
@@ -453,17 +443,11 @@ export const makeStore = (hashOverride?: string) =>
             yield* ensureApplicable(violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
 
             probe?.phase("staging, uniqueness and edges");
-            if (snapshot.removedUnique.length)
-              yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND attribute IN ${sql.in(snapshot.removedUnique)}`;
-            const steps = [...snapshot.steps.values()];
-            for (const { entity, keys } of steps) {
-              if (snapshot.desiredUnique.size) {
-                const released = keys.filter((key) => snapshot.desiredUnique.has(key));
-                if (released.length)
-                  yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${entity.id} AND attribute IN ${sql.in(released)}`;
-              }
-              if (keys.some((key) => snapshot.edges.has(key))) yield* refs.update(account, entity, keys, snapshot.edges);
-            }
+            for (const [shape, { release }] of snapshot.slots)
+              if (release.length)
+                yield* sql`DELETE FROM live_unique u USING events c
+                  WHERE u.account_id=${account} AND c.account_id=u.account_id AND c.entity_id=u.entity_id
+                    AND c.kind='create' AND c.shape=${shape} AND u.attribute IN ${sql.in(release)}`;
             let batch: UniqueSlot[] = [],
               encodedLength = 0;
             for (const slots of snapshot.uniqueSlots.values()) {
@@ -483,7 +467,6 @@ export const makeStore = (hashOverride?: string) =>
             probe?.phase("registry write");
             const document = JSON.stringify(desired);
             yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${document}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
-            yield* flush(account, steps);
             const { ms } = yield* clock.reserve(account, 1);
             yield* sql`INSERT INTO registry_versions(account_id,version,document,at)
               VALUES (${account},${version},${document},${new Date(ms + 1).toISOString()})`;
@@ -515,10 +498,14 @@ export const makeStore = (hashOverride?: string) =>
         for (const r of rows)
           if (r.op === "assert") facts[r.attribute] = decodeValue(r.value);
           else delete facts[r.attribute];
+        const [registry] = yield* sql<{ version: number; document: string }>`SELECT version,document
+          FROM registry_versions WHERE account_id=${account} AND at<=${at} ORDER BY at DESC,version DESC LIMIT 1`;
         return {
           id,
           shape: last.shape,
-          facts,
+          facts: registry
+            ? compiled(account, registry.version, app.normalize(JSON.parse(registry.document))).visible(last.shape, facts)
+            : facts,
           version: last.version,
           registry_version: last.registry_version,
           created_at: last.created_at,
@@ -529,37 +516,29 @@ export const makeStore = (hashOverride?: string) =>
       writeTransaction(
         Effect.gen(function* () {
           yield* lock(account);
-          const before = yield* getLive(account, id, "delete"),
+          const before = yield* getStored(account, id, "delete"),
             { version, registry } = yield* getRegistry(account),
-            { edges } = compiled(account, version, registry),
+            config = compiled(account, version, registry),
             steps: Step[] = [];
-          const incoming = edges.size ? (yield* refs.incoming(account, id, edges)).filter((row) => row.entity_id !== id) : [];
+          const incoming = config.edges.size ? (yield* refs.incoming(account, id, config)).filter((row) => row.entity_id !== id) : [];
           yield* ensureApplicable(
             incoming
               .filter((row) => row.on_delete === "block")
               .map((row) => issue(`${row.entity_id}.facts.${row.attribute}`, "Referenced")),
           );
-          yield* stage(
-            steps,
-            account,
-            before,
-            { ...before, facts: {}, registry_version: version },
-            registry,
-            edges,
-            actor,
-            "api",
-            "delete",
-          );
+          yield* stage(steps, account, before, { ...before, facts: {}, registry_version: version }, config, actor, "api", "delete");
           let referrer: Entity | undefined;
           for (const row of incoming) {
             if (referrer?.id !== row.entity_id) {
-              referrer = yield* getLive(account, row.entity_id, "write").pipe(Effect.catchTag("NotFound", () => Effect.succeed(undefined)));
+              referrer = yield* getStored(account, row.entity_id, "write").pipe(
+                Effect.catchTag("NotFound", () => Effect.succeed(undefined)),
+              );
             }
             // A concurrent writer may have retracted or redirected this edge
             // while we waited for the referrer's row lock.
             if (referrer?.facts[row.attribute] !== id) continue;
             const after = { ...referrer, facts: merge(referrer.facts, { [row.attribute]: null }), registry_version: version };
-            referrer = yield* stage(steps, account, referrer, after, registry, edges, `reference:${id}`, "reference");
+            referrer = yield* stage(steps, account, referrer, after, config, `reference:${id}`, "reference");
           }
           yield* flush(account, steps);
         }),
@@ -568,10 +547,9 @@ export const makeStore = (hashOverride?: string) =>
       sql.withTransaction(
         Effect.gen(function* () {
           yield* lock(account);
-          yield* getLive(account, id, "reference");
+          yield* getStored(account, id, "reference");
           const { version, registry } = yield* getRegistry(account);
-          const { edges } = compiled(account, version, registry);
-          return { data: yield* refs.incoming(account, id, edges) };
+          return { data: yield* refs.incoming(account, id, compiled(account, version, registry)) };
         }),
       );
     const plan = (account: string, desired: Registry) =>
@@ -597,7 +575,7 @@ export const makeStore = (hashOverride?: string) =>
           next_after: rows.length ? Number(rows.at(-1)!.seq) : null,
         })),
       );
-    return { getRegistry, compiled, live, getLive, mutate, apply, history, asOf, remove, referrers, plan, outbox, sql };
+    return { getRegistry, compiled, live, getLive, readEntity, mutate, apply, history, asOf, remove, referrers, plan, outbox, sql };
   });
 export type StoreValue = Effect.Success<ReturnType<typeof makeStore>>;
 export class Store extends Context.Service<Store, StoreValue>()("data/Store") {

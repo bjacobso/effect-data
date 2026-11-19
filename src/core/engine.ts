@@ -66,7 +66,10 @@ export function engine(kinds: readonly RegisteredKind[]) {
             const target = kinds.find((k) => k.name === ref.to);
             const resolved = target && r[target.collection]?.find((d) => d[target.identity] === ref.key);
             const members = ref.context?.members ?? (ref.context?.shape ? findShape(r, ref.context.shape)?.attributes : undefined);
-            return !resolved || (ref.context?.shape && !members) || (members && !members.includes(ref.key))
+            return !resolved ||
+              (ref.to === "attribute" && resolved.retired === true) ||
+              (ref.context?.shape && !members) ||
+              (members && !members.includes(ref.key))
               ? [issue(ref.path, `Unknown ${ref.to} in context`)]
               : [];
           })
@@ -83,12 +86,16 @@ export function engine(kinds: readonly RegisteredKind[]) {
   function compile(r: Registry) {
     const attributes = new Map((r.attributes ?? []).map((a) => [a.key, valueSchema(a)]));
     const schemas = new Map((r.shapes ?? []).map((s) => [s.key, entitySchema(attributes, s, s.attributes)]));
+    const members = new Map(r.shapes.map((s) => [s.key, new Set(s.attributes)]));
+    const visible = (shape: string, facts: Facts): Facts =>
+      Object.fromEntries(Object.entries(facts).filter(([key]) => members.get(shape)?.has(key)));
+    const unique = new Set(r.attributes.filter((a) => a.unique).map((a) => a.key));
     const rules = new Map<string, ReturnType<typeof evaluator>>();
     for (const kind of kinds)
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
     const reactions = new Map<string, Automation[]>();
     for (const d of r.automations ?? []) for (const key of d.on.changed) reactions.set(key, [...(reactions.get(key) ?? []), d]);
-    return { schemas, attributes, rules, reactions, edges: attributeEdges(r.attributes ?? []) };
+    return { schemas, attributes, members, visible, unique, rules, reactions, edges: attributeEdges(r.attributes ?? []) };
   }
   function validate(r: Registry, shape: string, facts: Facts): Issue[] {
     const s = findShape(r, shape);
@@ -110,6 +117,18 @@ export function engine(kinds: readonly RegisteredKind[]) {
         else if (canonical(old.get(key)) !== canonical(next.get(key))) changes.push({ kind: k.name, key, change: "modified" });
       }
     }
+    const nextAttributes = new Map(desired.attributes.map((a, i) => [a.key, { ...a, i }]));
+    const retirement: Issue[] = [];
+    for (const { retired, ...before } of [...current.attributes].sort((a, b) => compare(a.key, b.key))) {
+      const next = nextAttributes.get(before.key);
+      if (!next) retirement.push(issue("attributes", `Attribute cannot be removed; set retired (${before.key})`));
+      else {
+        const { retired: nextRetired, i, ...after } = next;
+        if ((retired || nextRetired) && canonical(before) !== canonical(after))
+          retirement.push(issue(`attributes[${i}].retired`, "Retired attribute definition cannot change"));
+      }
+    }
+    issues.unshift(...retirement);
     const valid = !issues.length;
     const edges = attributeEdges(desired.attributes);
     const shapes = new Map(desired.shapes.map((s) => [s.key, s]));
