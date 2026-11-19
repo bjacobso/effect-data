@@ -481,8 +481,12 @@ export const makeStore = (hashOverride?: string) =>
             if (snapshot.previous.size || snapshot.edges.size)
               yield* refs.reconcile(account, snapshot.previous, snapshot.edges, snapshot.edgeSources.values());
             probe?.phase("registry write");
-            yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${JSON.stringify(desired)}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
+            const document = JSON.stringify(desired);
+            yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${document}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
             yield* flush(account, steps);
+            const { ms } = yield* clock.reserve(account, 1);
+            yield* sql`INSERT INTO registry_versions(account_id,version,document,at)
+              VALUES (${account},${version},${document},${new Date(ms + 1).toISOString()})`;
             probe?.phase("transaction completion");
             return { version, ...desired };
           }),

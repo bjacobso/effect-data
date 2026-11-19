@@ -744,6 +744,213 @@ The investigation table and verdict on H1-H4; per-step before/after numbers
 for all three apply scenarios and the concurrent-PATCH impact; lines changed
 by layer; what remains slow and what the next change would be.
 
+## Pass 6: soft removal and background rollout
+
+Goal: no registry apply holds the exclusive account lock for longer than it
+takes to write the registry. Pass 5 left two slow applies at 1M entities:
+making an attribute unique (37 s lock) and removing a populated attribute
+(118 s lock). Both stay slow for as long as apply rewrites existing data
+inside one transaction, so this pass changes the contract instead:
+
+- **Removing an attribute is a soft delete.** Apply writes no facts. Reads
+  hide the values; they come back if the attribute is added back.
+- **Making an attribute unique rolls out in the background.** Apply returns at
+  once. New writes are enforced immediately; existing duplicates become
+  **violation records** that people can list, act on and fix.
+- Today's all-or-nothing behaviour stays available as `mode: "strict"`.
+
+This is a wire-contract change. SPEC.md changes in the same commits as the
+code (sections 2.2, 2.5, 4, 5, 6, 8, 9 and 11 at least). Branch:
+`pass-6-rollout`.
+
+### 0. Registry history (own commit, first)
+
+`registries` keeps only the current document. Add `registry_versions
+(account_id, version, document, at)` written on every apply in the same
+transaction, and backfill the current row for existing accounts. Needed for
+`as_of` in section 1. No behaviour change in this commit.
+
+### 1. Soft removal
+
+- **Visibility.** An entity's visible facts are the stored facts whose
+  attribute is in its shape under the registry being read against. Entity
+  reads, rules, automations, pack routes (`evaluate`, `certifications`),
+  `plan`, uniqueness and ref checks all use visible facts only.
+- **Apply writes no facts.** Removing an attribute from a shape, or retiring
+  it (below), only writes the registry. The stored projection keeps the hidden
+  values, so projection still equals replay of the log (keep the existing
+  property test green). New applies never write reason `migration`; the value
+  stays valid in old logs.
+- **Re-adding restores.** Putting the attribute back in the shape makes the
+  hidden values visible again, for every entity, without writes.
+- **Writes.** PATCH and create validate against visible facts. A hidden
+  attribute is not in the shape, so writing it is 422 as today. A write never
+  drops or changes hidden values.
+- **`as_of`** filters by the registry version in effect at that time (from
+  `registry_versions`). For a time before an account's earliest
+  `registry_versions` row (the section 0 backfill), return the unfiltered
+  replay, exactly as Pass 5 does: before this pass every removal retracted
+  facts physically, so there is nothing to hide. **History** is the log as written; a removal adds no
+  rows.
+- **Retirement.** Attribute gains `retired?: true`. Once an attribute has
+  been in an applied registry it can't be dropped from the document: omitting
+  it is a 422 issue at `attributes` ("Attribute cannot be removed; set
+  retired") naming the key. A retired attribute may not appear in any shape,
+  rule or action (normal reference checks report it). Its definition is
+  frozen while retired, and un-retiring (dropping `retired`) must keep the
+  definition unchanged in that same apply; it can change in a later apply.
+  This stops a key being reused with a different type over hidden values.
+- **Refs of hidden facts.** `live_refs` stays a projection of the **stored**
+  ref facts, hidden or not: soft removal never deletes its rows and re-adding
+  never has to restore them. Every read of it (delete blocking, `clear`,
+  `/referrers`) filters by the compiled registry's edges, so a hidden ref
+  never blocks a delete, is never cleared and is not listed, and a re-added
+  ref's `block`/`clear` takes effect the moment the apply commits. Precisely,
+  `live_refs` holds the stored facts (hidden or visible) of attributes whose
+  **current** type is `ref`. An apply that changes an attribute's type to or
+  from `ref` therefore adds or removes those rows before commit, under the
+  lock, as Pass 5 already does; this includes an attribute converted to `ref`
+  while hidden or in the same apply that re-adds it. Type changes stay a
+  locked, synchronous cost; record that in REPORT.md. Storage
+  stays free of type knowledge. Rows may point at targets deleted while the
+  ref was hidden; re-adding such a ref is what yields `dangling_reference`.
+- **Uniqueness of hidden facts.** Hidden unique values release their slots:
+  in rollout mode through the job (section 2), not under the lock; in strict
+  mode before commit. In rollout mode, until the job reaches an entity, its
+  hidden unique value can still collide with a new write (409); record that in
+  SPEC section 9 as a known limit.
+
+### 2. Background rollout
+
+- **Mode.** `PUT /v2/registry` accepts `mode?: "rollout" | "strict"`,
+  default `rollout`. `plan` reports the same violations as today and gains
+  `mode` in its input to say which of them would block.
+- **What rolls out.** Only two violation kinds become records instead of
+  blocking: `duplicate` (becoming unique, or un-hiding values that are now
+  duplicates) and `dangling_reference` (un-hiding a ref whose target is gone
+  or has the wrong shape). Every other violation (missing required, value no
+  longer decodes, shape removed with live entities, ref target or `on_delete`
+  changes that dangle existing refs) blocks with 409 in both modes, exactly as
+  today, using the Pass 5 classified preflight.
+- **Strict mode** is today's apply for duplicates and dangling refs: 409 if
+  any exist, otherwise **all** slot work for the change is done before commit:
+  releasing slots of values that become hidden first, then claiming slots for
+  values that become visible or unique. Strict mode starts no rollout. So a
+  strict apply that hides `x` in one shape and re-adds it in another moves the
+  slot atomically, and its preflight only looks at the desired visible data.
+  Soft removal (no fact writes) applies in both modes.
+- **Rollout mode** defers all slot work to the job, which does every release
+  for the rollout before any claim.
+- **Apply in rollout mode** writes the registry and a `rollouts` row
+  `(account_id, registry_version, status running|done|superseded, cursor,
+  processed, total, started_at, finished_at)` and commits. Target: exclusive
+  lock under 100 ms at 1M entities for both make-unique and remove-populated.
+- **The job** reconciles affected entities to the current registry: unique
+  slots, `live_refs` rows and violation records, nothing else. It runs as an
+  Effect fiber in the server process, in batches (start at 1,000 entities by
+  id) each in its own transaction under the **shared** account lock, so
+  entity writes keep going. It is idempotent per entity and resumes from
+  `cursor` after a restart. Only one instance works an account's rollout
+  (claim with `FOR UPDATE SKIP LOCKED` or a session advisory lock; your call,
+  justify it in REPORT.md). A later apply marks the running rollout
+  `superseded` and starts a new one against the new registry; the new one
+  must cover whatever the old one hadn't reached (simplest: the union of both
+  affected sets).
+- **Writes during a rollout** follow the new registry immediately. A write
+  that sets a newly unique attribute must claim the slot; if an entity the job
+  hasn't reached holds the same value without a slot, the writer still wins
+  and the job later records that entity as the duplicate.
+- **Duplicates.** The slot holder is whoever holds the slot; among entities
+  the job reconciles in one batch, the lowest id wins. Every other live entity
+  with that visible value gets a `duplicate` violation.
+
+### 3. Violation records
+
+- Table `violations (account_id, id, entity_id, attribute, issue, value,
+  status open|resolved, registry_version, opened_tx, opened_at, resolved_tx,
+  resolved_at)`. At most one open record per (entity, attribute, issue): a
+  unique ref can be both `duplicate` and `dangling_reference`, and gets both
+  records.
+- **Opened** by the rollout job (and by nothing else in this pass).
+- **Resolved** in the same transaction as whatever fixes it: the entity's
+  value changes or is retracted, the entity is deleted, the attribute stops
+  being unique or leaves the shape (resolved by the next rollout), the ref
+  target becomes valid, or the slot holder gives the value up. When a slot is
+  released and open duplicates for that value remain, the lowest-id one takes
+  the slot and its record resolves.
+- **Writes to an entity with an open violation** succeed if they don't make
+  things worse. Keeping a duplicate value unchanged while patching other
+  facts is allowed; setting a new duplicate value is 409 as usual.
+- **Outbox.** Opening and resolving each append an outbox item with
+  `automation_id: null`, `op: "violation_opened" | "violation_resolved"`,
+  `violation_id`, `attribute`, `issue`.
+- **HTTP.** `GET /v2/violations?status=open|resolved&attribute=&after=&limit=`
+  paged like the outbox. `GET /v2/registry` gains `rollout: { version,
+  status, processed, total } | null`. Entity reads gain `violations: [{
+  attribute, issue }]` listing open records.
+
+### 4. Tests and conformance
+
+- **New black-box suite `conformance/data-rollout.ts`** (Effect, no `src/`
+  imports, same style as the others). Cases: make unique over duplicates in
+  rollout mode returns 200 and duplicates appear as records once the rollout
+  is done (poll `GET /v2/registry`); a new duplicate write is 409 during and
+  after; fixing a duplicate resolves its record and the outbox shows both
+  events; strict mode returns 409 as before; remove an attribute from a shape
+  → reads hide it, history unchanged, re-add → values back; dropping an
+  attribute key is 422; changing a retired definition is 422; hide a ref,
+  delete its target (not blocked), re-add → `dangling_reference` record;
+  missing-required still 409 in rollout mode.
+- **Update existing suites** only where this pass changes the contract (for
+  example a case expecting 409 for duplicates on make-unique now sends
+  `mode: "strict"`); say which cases changed in REPORT.md.
+- **Differential property test (storage).** After random entity writes, random
+  registry changes in rollout mode and the job running to completion with
+  writes interleaved between batches (and some applies superseding a running
+  rollout), check against a from-scratch computation over the visible facts:
+  - `live_refs` equals the stored ref facts of live entities;
+    `dangling_reference` records equal the from-scratch set;
+  - for each unique attribute and visible value among live entities, exactly
+    one entity holds the slot and every other one has an open `duplicate`
+    record; no entity both holds the slot and has the record; there are no
+    slots or open records for hidden, deleted or no-longer-unique facts.
+  **Which** entity holds a slot is not compared: incumbents keep their slots,
+  so it depends on write order. A failed write is simply not replayed.
+- **Restart test:** stop the job mid-rollout, start a new Store, it finishes
+  from `cursor` with the same result.
+- **Supersede test:** a second apply during a rollout leaves a final state
+  that satisfies the same invariants as the property test for the latest
+  registry.
+- Keep every existing test and suite green.
+
+### 5. Benchmark
+
+Rerun the three Pass 5 apply scenarios at 1M in rollout mode and record,
+per scenario: exclusive lock time (target < 100 ms for all three), rollout
+duration and entities/s, same-account PATCH p50/p99 during the rollout
+(target p99 < 100 ms), and for make-unique the number of violation records
+(seed some duplicates so it's non-zero). Also rerun make-unique in strict
+mode on a separate duplicate-free attribute (strict mode rejects the seeded
+one), to show the locked slot writes still match Pass 5.
+
+### Constraints for this pass
+
+- Storage stays free of attribute-type knowledge; violation kinds and
+  visibility come from core (`compile()` output), not `"ref"` checks in
+  storage.
+- Do not change PostgreSQL configuration.
+- Commits: section 0, then soft removal, then rollout and violations, then
+  bench and report. Each behaviour commit updates SPEC.md.
+- If a decision here turns out wrong or contradictory, write QUESTIONS.md and
+  stop rather than guess.
+
+### REPORT.md "Pass 6" section
+
+Lock times and rollout numbers against the targets; which conformance cases
+changed and why; lines changed by layer; open limits (hidden unique values
+holding slots until the rollout reaches them, storage kept by hidden values,
+no purge).
+
 ## Deferred: queries (formerly planned as Pass 5)
 
 Goal: a query is **another document kind** checked by the existing reference
