@@ -7,15 +7,16 @@ import { SqlClient } from "effect/sql";
 import { dataLayer } from "../src/composition.ts";
 import type { Registry } from "../src/core/model.ts";
 import { migrate } from "../src/Migrations.ts";
-import { Store } from "../src/storage/Store.ts";
+import { Store, type StoreValue } from "../src/storage/Store.ts";
 import { average, measure, measureExit } from "./timing.ts";
 
-const mode = process.env.BENCH_MODE ?? "pass5";
+const mode = process.env.BENCH_MODE ?? "pass6";
+const rolloutBenchmark = mode === "pass6";
 const withRefs = mode !== "baseline";
 const step = process.env.BENCH_STEP ?? "investigation";
 const url = new URL(process.env.BENCH_DATABASE_URL ?? "postgres://localhost:5432/onb_data_bench");
-if (url.pathname !== "/onb_data_bench" || !["baseline", "refs", "pass5"].includes(mode))
-  throw new Error("Use the onb_data_bench database and BENCH_MODE=baseline, refs or pass5");
+if (url.pathname !== "/onb_data_bench" || !["baseline", "refs", "pass5", "pass6"].includes(mode))
+  throw new Error("Use the onb_data_bench database and BENCH_MODE=baseline, refs, pass5 or pass6");
 
 const bigCount = Number(process.env.BENCH_ENTITIES ?? 1_000_000);
 const writesPerWorker = Number(process.env.BENCH_WRITES ?? 250);
@@ -27,7 +28,7 @@ if (!Number.isSafeInteger(bigCount) || bigCount < workers + 6 || !Number.isSafeI
 // fixture schema and a different account key while the investigation runs.
 const fixes = mode === "pass5" && step !== "investigation";
 const namespace = fixes ? "effect_data_bench_pass5_fixes" : `effect_data_bench_${mode}`;
-const big = fixes ? "bench_big_fixes" : "bench_big";
+const big = rolloutBenchmark ? "bench_big_pass6" : fixes ? "bench_big_fixes" : "bench_big";
 const small = Array.from({ length: 100 }, (_, i) => `${fixes ? "bench_small_fixes" : "bench_small"}_${i}`);
 const smallCount = 32;
 const historySizes = [10, 1_000, 10_000];
@@ -84,7 +85,9 @@ const seed = Effect.fnUntraced(function* (account: string, count: number) {
           'id',entity_id,'shape',shape,'version',1,'registry_version',1,'created_at',at,'updated_at',at,
           'facts',jsonb_build_object(
             'bench/link','en_' || lpad((tx % ${count} + 1)::text,21,'0'),
-            'bench/name','name','bench/count',tx,'bench/ratio',1.5,
+             'bench/name','name',
+            'bench/count',CASE WHEN ${rolloutBenchmark} AND tx % 1000 = 0 THEN tx - 1 ELSE tx END,
+            'bench/ratio',CASE WHEN ${rolloutBenchmark} THEN tx * 1.5 ELSE 1.5 END,
             'bench/flag',false,'bench/day','2024-01-01','bench/state','a'
           )
         )::text FROM events WHERE account_id=${account} AND tx BETWEEN ${start} AND ${end}
@@ -108,7 +111,7 @@ const seed = Effect.fnUntraced(function* (account: string, count: number) {
   }
   let lastTx = count;
   const snapshots = [];
-  if (account === big)
+  if (account === big && !rolloutBenchmark)
     for (const [i, size] of historySizes.entries()) {
       const id = entityId(i + 1);
       const extra = size - populated.length;
@@ -177,27 +180,102 @@ const patchRun = Effect.fnUntraced(function* (spread: boolean, concurrency = wor
   };
 });
 
+const measureRollout = Effect.fnUntraced(function* (store: StoreValue, version: number, previousFlag: boolean) {
+  const initial = yield* store.rolloutStatus(big, version);
+  if (!initial) throw new Error("Expected a rollout row");
+  if (initial.status === "done")
+    return {
+      duration_ms: 0,
+      entities: 0,
+      entities_per_second: null,
+      batches: 0,
+      patch: null,
+    };
+  let done = false,
+    batches = 0;
+  const start = performance.now();
+  const [duration, concurrent] = yield* Effect.all(
+    [
+      Effect.gen(function* () {
+        while (yield* store.runRolloutBatch(big)) {
+          batches++;
+          if (batches % 250 === 0) console.log(`Committed ${batches} rollout batches`);
+        }
+        return performance.now() - start;
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            done = true;
+          }),
+        ),
+      ),
+      Effect.forEach(
+        Array.from({ length: workers }, (_, i) => i),
+        (i) =>
+          Effect.gen(function* () {
+            const samples: number[] = [];
+            let flag = !previousFlag;
+            while (!done) {
+              const start = performance.now();
+              yield* store.mutate(big, "bench", { facts: { "bench/flag": flag } }, entityId(4 + i));
+              samples.push(performance.now() - start);
+              flag = !flag;
+            }
+            return samples;
+          }),
+        { concurrency: workers },
+      ),
+    ],
+    { concurrency: "unbounded" },
+  );
+  const final = yield* store.rolloutStatus(big, version);
+  if (!final || final.status !== "done" || final.processed !== bigCount) throw new Error("Rollout did not visit all fixture entities");
+  const samples = concurrent.flat();
+  return {
+    duration_ms: duration,
+    entities: final.processed,
+    entities_per_second: (final.processed * 1_000) / duration,
+    batches,
+    patch: { samples: samples.length, ...latencies(samples) },
+  };
+});
+
 const benchmark = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Store;
   yield* migrate;
   if ((yield* store.getRegistry(big)).version !== 0) throw new Error("Benchmark fixture must start empty");
   const snapshots = yield* seed(big, bigCount);
-  yield* Effect.forEach(small, (account) => seed(account, smallCount), { concurrency: workers, discard: true });
+  if (!rolloutBenchmark) yield* Effect.forEach(small, (account) => seed(account, smallCount), { concurrency: workers, discard: true });
   yield* sql`ANALYZE entities`;
   yield* sql`ANALYZE events`;
   yield* sql`ANALYZE facts`;
   if (withRefs) yield* sql`ANALYZE live_refs`;
-  console.log("Measuring PATCH throughput");
-  const single = yield* patchRun(false, 1);
-  const busy = yield* patchRun(false);
-  const spread = yield* patchRun(true);
+  const patch = rolloutBenchmark
+    ? { warmup: yield* patchRun(false) }
+    : yield* Effect.gen(function* () {
+        console.log("Measuring PATCH throughput");
+        const single = yield* patchRun(false, 1);
+        const busy = yield* patchRun(false);
+        const spread = yield* patchRun(true);
+        return { single, busy, spread };
+      });
   const attach = { ...registry, shapes: [{ key: "bench", attributes: attributes.map(({ key }) => key) }] };
   const makeUnique = { ...attach, attributes: attributes.map((a) => (a.key === "bench/count" ? { ...a, unique: true } : a)) };
   const remove = { ...attach, shapes: [{ key: "bench", attributes: attach.shapes[0]!.attributes.filter((key) => key !== "bench/state") }] };
+  const removeAfterMakeUnique = { ...remove, attributes: makeUnique.attributes };
+  const strict = { ...remove, attributes: attributes.map((a) => (a.key === "bench/ratio" ? { ...a, unique: true } : a)) };
   const apply = {} as Record<string, unknown>;
-  const scenarios =
-    mode === "pass5"
+  const scenarios = rolloutBenchmark
+    ? ([
+        ["attach_optional", attach],
+        ["make_unique", makeUnique],
+        ["remove_populated", removeAfterMakeUnique],
+        // The seeded duplicate attribute remains unique during the removal.
+        // An untimed rollout releases its slots before the strict comparison.
+        ["make_unique_strict", strict],
+      ] as const)
+    : mode === "pass5"
       ? ([
           ["attach_optional", attach],
           ["make_unique", makeUnique],
@@ -206,20 +284,28 @@ const benchmark = Effect.gen(function* () {
       : ([["attach_optional", attach]] as const);
   let version = 1;
   for (const [i, [name, desired]] of scenarios.entries()) {
+    if (name === "make_unique_strict") {
+      console.log("Resetting the duplicate attribute through an untimed rollout");
+      yield* store.apply(big, "bench", remove, version++, "rollout");
+      while (yield* store.runRolloutBatch(big)) {}
+    }
     console.log(`Measuring registry apply: ${name}`);
     const granted = Promise.withResolvers<boolean>();
     let lockStart = 0;
     let rssAfterLoad = 0;
     const [operation, concurrent] = yield* Effect.all(
       [
-        measureExit(store.apply(big, "bench", desired, version), (phase, now) => {
-          if (phase === "registry read") {
-            lockStart = now;
-            granted.resolve(true);
-          }
-          if (phase === "registry checks and diff" || phase === "preflight validation and staging")
-            rssAfterLoad = Math.max(rssAfterLoad, process.memoryUsage.rss());
-        }).pipe(Effect.tap(() => Effect.sync(() => granted.resolve(false)))),
+        measureExit(
+          store.apply(big, "bench", desired, version, rolloutBenchmark && name !== "make_unique_strict" ? "rollout" : "strict"),
+          (phase, now) => {
+            if (phase === "registry read") {
+              lockStart = now;
+              granted.resolve(true);
+            }
+            if (phase === "registry checks and diff" || phase === "preflight validation and staging")
+              rssAfterLoad = Math.max(rssAfterLoad, process.memoryUsage.rss());
+          },
+        ).pipe(Effect.tap(() => Effect.sync(() => granted.resolve(false)))),
         Effect.promise(() => granted.promise).pipe(
           Effect.flatMap((locked) =>
             locked
@@ -246,7 +332,15 @@ const benchmark = Effect.gen(function* () {
       const [row] = yield* sql`SELECT 1 FROM live_unique WHERE account_id=${big} LIMIT 1`;
       if (row) throw new Error("Failed apply left a uniqueness projection");
     }
+    const rollout = rolloutBenchmark && name !== "make_unique_strict" ? yield* measureRollout(store, version, i % 2 === 0) : null;
+    const [duplicates] = rolloutBenchmark
+      ? yield* sql<{ count: string }>`SELECT count(*)::text AS count FROM violations
+        WHERE account_id=${big} AND status='open' AND issue='duplicate'`
+      : [];
+    if (rolloutBenchmark && name === "make_unique" && Number(duplicates?.count) !== Math.floor(bigCount / 1000))
+      throw new Error("Did not record the expected seeded duplicates");
     const result = {
+      ...(rolloutBenchmark && { rollout, open_duplicate_records: Number(duplicates?.count) }),
       ...(failure && { failure }),
       wall_ms: operation.wall_ms,
       exclusive_lock_ms: operation.end_ms - lockStart,
@@ -260,7 +354,7 @@ const benchmark = Effect.gen(function* () {
     };
     console.log(JSON.stringify({ scenario: name, ...result }));
     apply[name] = result;
-    if (name === "make_unique" && !failure) {
+    if (!rolloutBenchmark && name === "make_unique" && !failure) {
       // Restore the pre-scenario registry and uniqueness projection so the
       // removal alone determines work in the next apply. Preserve the CAS version.
       yield* sql.withTransaction(
@@ -271,7 +365,7 @@ const benchmark = Effect.gen(function* () {
       );
     }
   }
-  console.log("Measuring as_of latency");
+  if (!rolloutBenchmark) console.log("Measuring as_of latency");
   const as_of = yield* Effect.forEach(snapshots, ({ id, at, history_rows, version }) =>
     Effect.gen(function* () {
       const history = yield* store.history(big, id);
@@ -305,7 +399,7 @@ const benchmark = Effect.gen(function* () {
     fixture: {
       large_account: big,
       large_entities: bigCount,
-      small_accounts: small.length,
+      small_accounts: rolloutBenchmark ? 0 : small.length,
       entities_per_small_account: smallCount,
       attributes: attributes.length,
       initial_shape_attributes: 199,
@@ -313,7 +407,7 @@ const benchmark = Effect.gen(function* () {
       workers,
       writes_per_worker: writesPerWorker,
     },
-    patch: { single, busy, spread },
+    patch,
     apply,
     as_of,
   };

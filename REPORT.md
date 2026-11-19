@@ -989,3 +989,124 @@ additional SQL migration adds a nine-line index definition outside `src/`.
 `data-certs.ts` passed 6/6, and `data-refs.ts` passed 7/7. With
 `PACKS=onboarding`, `data.ts` passed 15/15 again. Both server runs were
 stopped.
+
+## Pass 6
+
+### Rollout and storage decisions
+
+The server worker takes the shared account advisory lock, then claims the
+running job row with `FOR UPDATE SKIP LOCKED`. The row lock, projection writes,
+outbox writes and phase/cursor update share one transaction. A crashed worker
+releases its claim on rollback. Another worker can continue from the last
+committed cursor without a separate lease or timeout. A superseding apply
+restarts the union of affected shapes under the new registry. The job
+performs a full release pass before entering the claim phase when the change
+can invalidate slots. For claim-only changes it starts in the claim phase.
+
+The worker starts with batches of 1,000 creation ids and serializes with entity
+writes on the affected rows. A bounded set of per-account value lock stripes
+coordinates value interning, slot claims and promotions with writers. The
+exclusive account lock covers all strict slot releases and claims. A strict
+apply also rebuilds inherited slots if it supersedes a running job. This
+covers values changed while an earlier rollout was releasing their old slots.
+A single SQL statement reserves the clock position, installs the registry,
+records its history and changes rollout metadata.
+
+Registry history distinguishes a first optional attachment from restoring a
+previous member. A first attachment and removal of a non-unique, non-ref fact
+can finish with an empty job scope. Such a rollout row is immediately done.
+A plan reports `blocking` on each violation. The plan and a strict preflight
+consider pending work and existing open records against the proposed registry.
+The rollout preflight skips duplicate-only work and the worker reconciles
+duplicates against committed data.
+
+A ref restored from hidden storage can produce a dangling record even when the
+same apply changes its type to ref. If the restored value fails the new type's
+decoder, the apply still fails. Retargeting a visible ref that makes an open
+record valid resolves the record in the registry transaction. A target's
+shape and id are immutable, so a write repairs the dangling reference by
+changing or retracting the source value. The worker leaves the ref projection
+in place across visibility changes. Type changes to and from ref still do
+synchronous projection work under the exclusive lock, including for hidden
+facts. The projection can store malformed legacy values on conversion while
+hidden, using their JSON encoding so those values cannot match a target id.
+
+Entity metadata keeps the last entity write's version, registry version and
+timestamps. Historical reads use registry history for visibility and show
+violation records open at the requested time. Hidden values occupy storage
+and have no purge path. A hidden unique value can still block a write until
+the release phase reaches it. PostgreSQL configuration was unchanged.
+
+### Verification and source size
+
+`make test` passed all 53 tests, including a 20-case randomized rollout
+projection comparison with writes between batches, superseding changes, a
+replacement Store resuming from the persisted cursor, and strict and
+background slot moves between shapes.
+
+With `BASE_URL=http://localhost:8086` against `make run`, `data.ts` passed
+15/15, `data-certs.ts` passed 6/6, `data-refs.ts` passed 7/7 and the new
+`data-rollout.ts` passed 3/3. With `PACKS=onboarding`, `data.ts` passed 15/15
+again. Both application server runs were stopped.
+
+The existing data suite now uses retirement for plans that remove a key
+from use and strict mode for its combined duplicate and blocking violations
+case. It checks soft removal and reads with the new registry and entity
+metadata. The certification suite retires the expiry attribute to keep its
+dependency-check scenario and expects rollout metadata on registry GET.
+The ref suite checks the blocking flag on incompatible conversions and
+retargeting. The new suite checks duplicate enforcement and resolution,
+outbox events, soft removal, retirement and restored dangling refs.
+
+| TypeScript layer | Pass 5 | Pass 6 | Net |
+| --- | ---: | ---: | ---: |
+| Core | 842 | 939 | +97 |
+| Storage | 697 | 1,247 | +550 |
+| HTTP | 351 | 417 | +66 |
+| Packs | 292 | 290 | −2 |
+| Composition and migration wiring | 98 | 116 | +18 |
+| **Total `src/`** | **2,280** | **3,009** | **+729** |
+| SQL migrations | 55 | 106 | +51 |
+| Tests | 1,445 | 1,714 | +269 |
+| Conformance | 1,669 | 1,871 | +202 |
+
+The original 1,200-line source budget remains exceeded. Most growth this pass
+is the batched rollout worker and transactional slot and violation handling.
+
+### One-million-entity benchmark
+
+The workload uses the same large-account shape as Pass 5, with 199
+initial members and seven populated facts per entity, including one ref.
+Every thousandth `bench/count` duplicates the preceding value. The
+duplicate-free `bench/ratio` drives the strict comparison after an untimed
+rollout removes the first uniqueness constraint. Removal hides the same
+populated non-unique `bench/state` member as Pass 5.
+
+The benchmark uses the Store directly and warms the connection pool with
+same-account PATCH writes on the seeded fixture. Apply lock time runs from
+lock acquisition through transaction completion. Each apply also starts 16
+same-account PATCH requests at lock acquisition. During the background
+job, 16 clients repeatedly toggle an unrelated boolean fact on the same
+account. Rollout duration measures worker execution from dispatch through
+the final committed batch. An empty job has zero processed entities and no
+during-rollout samples.
+
+| Apply | Apply wall (ms) | Exclusive lock (ms) | Rollout (s) | Entities/s | PATCH during apply p50 / p99 (ms) | PATCH during rollout p50 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Attach optional | 23.71 | 8.34 | 0 | — | 18.11 / 22.37 | — |
+| Make unique | 18.16 | 5.41 | 171.58 | 5,828 | 15.58 / 18.66 | 6.63 / 98.96 |
+| Remove populated | 20.50 | 9.21 | 0 | — | 15.36 / 20.27 | — |
+| Make unique, strict | 56,241.35 | 43,247.84 | — | — | 43,285.32 / 43,300.03 | — |
+
+All three rollout-mode applies met the 100 ms exclusive-lock target in
+the final warmed run. The make-unique worker visited one million entities
+and opened 1,000 duplicate records. The rollout PATCH p99 met the 100 ms
+target by about 1 ms across 186,953 samples. Attach optional and removal
+of the populated non-unique member completed with empty rollout scopes.
+
+Strict make-unique spent 43.22 s on 200 batches of locked slot writes.
+Its 43.25 s lock hold was in the same range as Pass 5's 37.47 s, and the
+concurrent writes waited for the lock. The final database contained one
+million strict uniqueness slots, all 1,000 duplicate records resolved by
+the untimed reset, one million retained hidden values, zero migration
+facts and zero running jobs. [Raw benchmark results](bench/results-pass6-current.json)

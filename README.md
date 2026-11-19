@@ -77,8 +77,8 @@ retracts the incoming fact and records it in history with reason
 BASE_URL=http://localhost:8086 node conformance/data-refs.ts
 ```
 
-The Pass 4 benchmark invokes the Store directly. Create the dedicated
-`onb_data_bench` database once and run the matched ref workload with:
+The benchmark invokes the Store directly. Create the dedicated
+`onb_data_bench` database once and run the Pass 6 rollout workload.
 
 ```sh
 createdb -h localhost onb_data_bench
@@ -86,7 +86,8 @@ make bench
 ```
 
 Use `BENCH_DATABASE_URL` to override the connection URL. Each run recreates
-its own benchmark schema in that database and writes `bench/results-refs.json`.
-Run `make bench` at the baseline commit to reproduce `bench/results-baseline.json`.
-`BENCH_ENTITIES` and `BENCH_WRITES` override the one-million-entity and
-250-writes-per-worker defaults for a smoke run, which writes a separate result.
+its own benchmark schema in that database and writes
+`bench/results-pass6-current.json`. `BENCH_ENTITIES` overrides the
+one-million-entity default for a smoke run, which writes a separate result.
+Historical benchmark results and their workloads are documented in
+[REPORT.md](REPORT.md).
