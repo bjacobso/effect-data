@@ -8,7 +8,7 @@ import { DataLive } from "../src/composition.ts";
 import { Engine, type EngineValue } from "../src/core/engine.ts";
 import { makeStore, encodeValue, decodeValue, Store, type StoreValue } from "../src/storage/Store.ts";
 import { migrate } from "../src/Migrations.ts";
-import { type Entity, type Facts, type Attribute, decodeIssues } from "../src/core/model.ts";
+import { type Entity, type Facts, type Attribute, type Registry, canonical, decodeIssues } from "../src/core/model.ts";
 import { valueSchema } from "../src/core/values.ts";
 import { fixture } from "./fixtures.ts";
 const runtime = ManagedRuntime.make(
@@ -187,7 +187,7 @@ test("projections and edges equal independent fact replay after random operation
         }
         for (const snapshot of snapshots) {
           const { effects: _, ...plain } = snapshot as Entity & { effects?: unknown };
-          expect(await run(store.asOf(a, snapshot.id, snapshot.updated_at))).toEqual(plain);
+          expect(await run(store.asOf(a, snapshot.id, snapshot.updated_at))).toEqual({ ...plain, violations: [] });
         }
       },
     ),
@@ -247,7 +247,7 @@ test("soft removal and deletion replay old state, pagination crosses decimal bou
     e = await run(store.mutate(a, "test", { shape: "employee", facts: { "person/email": "a", "person/note": "history" } }));
   const desired = fixture();
   desired.shapes![0]!.attributes = desired.shapes![0]!.attributes.filter((k: string) => k !== "person/note");
-  await run(store.apply(a, "admin", desired, 1));
+  await run(store.apply(a, "admin", desired, 1, "strict"));
   expect(await run(store.getLive(a, e.id))).toMatchObject({ registry_version: 1, facts: { "person/email": "a" } });
   expect((await run(store.history(a, e.id))).data.every((fact) => fact.reason !== "migration")).toBe(true);
   expect((await run(store.asOf(a, e.id, e.updated_at))).facts).toEqual(e.facts);
@@ -412,7 +412,7 @@ test("apply enables uniqueness beyond the shared advisory lock table without wri
   const count = 30_000;
   const { a, initial, attribute } = await seedDistinctBatch(count);
   const desired = { ...initial, attributes: initial.attributes.map((attr) => (attr.key === attribute ? { ...attr, unique: true } : attr)) };
-  expect((await run(store.apply(a, "admin", desired, 1))).version).toBe(2);
+  expect((await run(store.apply(a, "admin", desired, 1, "strict"))).version).toBe(2);
   const sql = store.sql;
   const [counts] = await run(sql<{ slots: string; events: string }>`SELECT
     (SELECT count(*) FROM live_unique WHERE account_id=${a})::text AS slots,
@@ -470,12 +470,16 @@ test("apply rechecks uniqueness groups when a writer changes a scanned value", a
   const first = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: 1 } }));
   const second = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: 2 } }));
   const loser = [first.id, second.id].sort()[1];
-  await expect(duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1)), () => patch(first.id, 2))).resolves.toMatchObject({
+  await expect(
+    duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1, "strict")), () => patch(first.id, 2)),
+  ).resolves.toMatchObject({
     _tag: "Conflict",
     issues: [{ field: `${loser}.facts.${attribute}`, issue: "Duplicate unique value" }],
   });
   const lower = [first.id, second.id].sort()[0]!;
-  await expect(duringPreflight(store.apply(a, "admin", desired, 1), () => patch(lower, 3))).resolves.toMatchObject({ version: 2 });
+  await expect(duringPreflight(store.apply(a, "admin", desired, 1, "strict"), () => patch(lower, 3))).resolves.toMatchObject({
+    version: 2,
+  });
 });
 
 test("apply detects a deleted target referenced by an unchanged source during preflight", async () => {
@@ -491,7 +495,7 @@ test("apply detects a deleted target referenced by an unchanged source during pr
   const target = await run(store.mutate(a, "test", { shape: "item", facts: {} }));
   const source = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: target.id } }));
   await expect(
-    duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1)), () => run(store.remove(a, "writer", target.id))),
+    duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1, "strict")), () => run(store.remove(a, "writer", target.id))),
   ).resolves.toMatchObject({ _tag: "Conflict", issues: [{ field: `${source.id}.facts.${attribute}`, issue: "Dangling reference" }] });
   expect((await run(store.getRegistry(a))).version).toBe(1);
 });
@@ -510,7 +514,7 @@ test("soft removal preserves values written before and after the apply", async (
   await run(store.apply(a, "test", initial, 0));
   const e = await run(store.mutate(a, "test", { shape: "item", facts: { "test/drop": 1, "test/keep": 2 } }));
   await run(store.mutate(a, "writer", { facts: { "test/drop": 3 } }, e.id));
-  await run(store.apply(a, "admin", desired, 1));
+  await run(store.apply(a, "admin", desired, 1, "strict"));
   const current = await run(store.mutate(a, "writer", { facts: { "test/keep": 4 } }, e.id));
   expect(current).toMatchObject({ facts: { "test/keep": 4 }, version: 3, registry_version: 2 });
   expect((await run(store.asOf(a, e.id, current.updated_at))).facts).toEqual(current.facts);
@@ -587,7 +591,7 @@ test("two Store instances with separate pools allocate increasing database tx/at
     }
     for (const snapshot of [...creates, ...updates]) {
       const { effects: _, ...plain } = snapshot;
-      expect(await run(other.asOf(a, snapshot.id, snapshot.updated_at))).toEqual(plain);
+      expect(await run(other.asOf(a, snapshot.id, snapshot.updated_at))).toEqual({ ...plain, violations: [] });
       const history = await run(store.history(a, snapshot.id));
       for (const fact of history.data) expect(fact.at).toBe(events.find((e) => Number(e.tx) === fact.tx)!.at);
     }
@@ -611,10 +615,10 @@ test("forced hash collisions compare exact values and retain database uniqueness
   ).toMatchObject({ _tag: "Failure", failure: { _tag: "Conflict", issues: [{ field: "facts.person/email" }] } });
   const relaxed = fixture();
   relaxed.attributes = relaxed.attributes.map((attr) => (attr.key === "person/email" ? { ...attr, unique: false } : attr));
-  await run(collisionStore.apply(a, "test", relaxed, 1));
+  await run(collisionStore.apply(a, "test", relaxed, 1, "strict"));
   const escaped = "third\u0000\ud800";
   await run(collisionStore.mutate(a, "test", { shape: "employee", facts: { "person/email": escaped } }));
-  await run(collisionStore.apply(a, "test", fixture(), 2));
+  await run(collisionStore.apply(a, "test", fixture(), 2, "strict"));
   const reused = await run(Effect.flip(collisionStore.mutate(a, "test", { shape: "employee", facts: { "person/email": escaped } })));
   expect(reused).toMatchObject({ _tag: "Conflict", issues: [{ field: "facts.person/email" }] });
   const values = await run(
@@ -632,4 +636,279 @@ test("compiled registry cache evicts least recently used entries at 1000", async
   expect(store.compiled("acct_cache_0", 1, r)).toBe(first);
   for (let i = 1001; i < 2001; i++) store.compiled(`acct_cache_${i}`, 1, r);
   expect(store.compiled("acct_cache_0", 1, r)).not.toBe(first);
+});
+
+const rollValue = "roll/value";
+const rollLink = "roll/link";
+const rollKeep = "roll/keep";
+function rolloutFixture(flags: number): Registry {
+  return {
+    attributes: [
+      { key: rollValue, type: "integer", unique: !!(flags & 1) },
+      { key: rollLink, type: "ref", target: "target", unique: !!(flags & 2) },
+      { key: rollKeep, type: "integer" },
+    ],
+    shapes: [
+      { key: "item", attributes: [rollKeep, ...(flags & 4 ? [] : [rollValue]), ...(flags & 8 ? [] : [rollLink])] },
+      { key: "target", attributes: [rollKeep] },
+    ],
+    automations: [],
+  };
+}
+async function drainRollout(s: StoreValue, a: string, limit = 3) {
+  for (let i = 0; i < 100; i++) if (!(await run(s.runRolloutBatch(a, limit)))) return;
+  throw new Error("Rollout did not finish");
+}
+async function checkRollout(a: string, registry: Registry) {
+  const entities = await run(store.live(a));
+  const byId = new Map(entities.map((e) => [e.id, e]));
+  const config = app.compile(registry);
+  const refs: string[][] = [];
+  const slots = new Map<string, string[]>();
+  const dangling: string[][] = [];
+  for (const entity of entities) {
+    for (const [key, value] of Object.entries(entity.facts))
+      if (config.edges.has(key)) refs.push([entity.id, key, config.storedRefTarget(value)]);
+    for (const [key, value] of Object.entries(config.visible(entity.shape, entity.facts))) {
+      if (config.unique.has(key)) {
+        const identity = canonical([key, value]);
+        slots.set(identity, [...(slots.get(identity) ?? []), entity.id]);
+      }
+      const edge = config.edges.get(key);
+      if (edge && byId.get(String(value))?.shape !== edge.target) dangling.push([entity.id, key, canonical(value)]);
+    }
+  }
+  const actualRefs = await run(store.sql<{ entity_id: string; attribute: string; target_id: string }>`
+    SELECT entity_id,attribute,target_id FROM live_refs WHERE account_id=${a}`);
+  expect(actualRefs.map((ref) => [ref.entity_id, ref.attribute, ref.target_id]).sort()).toEqual(refs.sort());
+  const holders = await run(store.sql<{ entity_id: string; attribute: string; value: string }>`
+    SELECT entity_id,attribute,value FROM live_unique WHERE account_id=${a}`);
+  const open = (await run(store.listViolations(a, "open", undefined, 0, 200))).data;
+  expect(holders).toHaveLength(slots.size);
+  const duplicate: string[][] = [];
+  for (const { entity_id, attribute, value } of holders) {
+    const members = slots.get(canonical([attribute, decodeValue(value)]));
+    expect(members).toContain(entity_id);
+    for (const id of members!.filter((id) => id !== entity_id)) duplicate.push([id, attribute, canonical(decodeValue(value))]);
+  }
+  for (const [issue, expected] of [
+    ["duplicate", duplicate],
+    ["dangling_reference", dangling],
+  ] as const)
+    expect(
+      open
+        .filter((v) => v.issue === issue)
+        .map((v) => [v.entity_id, v.attribute, canonical(v.value)])
+        .sort(),
+    ).toEqual(expected.sort());
+}
+
+test("rollout projections match a fresh derivation with writes and superseding applies between batches", async () => {
+  await fc.assert(
+    fc.asyncProperty(
+      fc.array(fc.record({ flags: fc.nat(15), writes: fc.array(fc.nat(45), { minLength: 1, maxLength: 6 }), supersede: fc.boolean() }), {
+        minLength: 3,
+        maxLength: 9,
+      }),
+      async (changes) => {
+        const a = account(),
+          targets: string[] = [],
+          items: string[] = [];
+        let version = 0;
+        await run(store.apply(a, "test", rolloutFixture(0), version++));
+        for (let n = 0; n < 5; n++) targets.push((await run(store.mutate(a, "test", { shape: "target", facts: { [rollKeep]: n } }))).id);
+        for (let n = 0; n < 12; n++)
+          items.push(
+            (
+              await run(
+                store.mutate(a, "test", {
+                  shape: "item",
+                  facts: { [rollValue]: n % 3, [rollLink]: targets[n % targets.length] },
+                }),
+              )
+            ).id,
+          );
+
+        for (const { flags, writes, supersede } of changes) {
+          const registry = rolloutFixture(flags);
+          await run(store.apply(a, "test", registry, version++));
+          for (const n of writes) {
+            await run(store.runRolloutBatch(a, 3));
+            const id = items[n % items.length]!;
+            const action = n % 6;
+            const next =
+              action === 0
+                ? store.remove(a, "test", targets[n % targets.length]!)
+                : action === 1
+                  ? store.remove(a, "test", id)
+                  : Effect.asVoid(
+                      store.mutate(
+                        a,
+                        "test",
+                        {
+                          facts:
+                            action <= 3
+                              ? { [rollValue]: n % 5 }
+                              : action === 4
+                                ? { [rollLink]: targets[(n + 1) % targets.length] }
+                                : { [rollKeep]: n },
+                        },
+                        id,
+                      ),
+                    );
+            const result = await run(Effect.result(next));
+            if (result._tag === "Failure") expect(["Conflict", "Invalid", "NotFound"]).toContain(result.failure._tag);
+          }
+          if (!supersede) {
+            await drainRollout(store, a);
+            await checkRollout(a, registry);
+          }
+        }
+        await drainRollout(store, a);
+        await checkRollout(a, rolloutFixture(changes.at(-1)!.flags));
+      },
+    ),
+    { numRuns: 20 },
+  );
+}, 60000);
+
+test("a new Store resumes from a persisted cursor and a later apply supersedes an unfinished rollout", async () => {
+  const a = account();
+  await run(store.apply(a, "test", rolloutFixture(0), 0));
+  for (let n = 0; n < 10; n++) await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: n % 2 } }));
+  await run(store.apply(a, "test", rolloutFixture(1), 1));
+  await run(store.runRolloutBatch(a, 3));
+  const [before] = await run(
+    store.sql<{ cursor: string; processed: number }>`SELECT cursor,processed FROM rollouts WHERE account_id=${a} AND registry_version=2`,
+  );
+  expect(before?.cursor).toMatch(/^en_/);
+  expect(before?.processed).toBe(3);
+  const replacement = await runtime.runPromise(makeStore());
+  await run(replacement.runRolloutBatch(a, 3));
+  const [after] = await run(
+    store.sql<{ cursor: string; processed: number }>`SELECT cursor,processed FROM rollouts WHERE account_id=${a} AND registry_version=2`,
+  );
+  expect(after!.cursor > before!.cursor).toBe(true);
+  expect(after?.processed).toBe(6);
+  await drainRollout(replacement, a);
+  await checkRollout(a, rolloutFixture(1));
+  await run(replacement.apply(a, "test", rolloutFixture(5), 2));
+  await run(replacement.runRolloutBatch(a, 3));
+  await run(replacement.apply(a, "test", rolloutFixture(1), 3));
+  const [superseded] = await run(store.sql<{ status: string }>`SELECT status FROM rollouts WHERE account_id=${a} AND registry_version=3`);
+  expect(superseded?.status).toBe("superseded");
+  await drainRollout(replacement, a);
+  await checkRollout(a, rolloutFixture(1));
+});
+
+test.each(["strict", "rollout"] as const)("moves a slot between shapes in %s mode, releasing before claiming", async (mode) => {
+  const a = account();
+  const base = rolloutFixture(1);
+  const first = {
+    ...base,
+    shapes: [
+      { key: "item", attributes: [rollKeep] },
+      { key: "target", attributes: [rollKeep, rollValue] },
+    ],
+  };
+  const second = {
+    ...base,
+    shapes: [
+      { key: "item", attributes: [rollKeep, rollValue] },
+      { key: "target", attributes: [rollKeep] },
+    ],
+  };
+  await run(store.apply(a, "test", first, 0, "strict"));
+  const target = await run(store.mutate(a, "test", { shape: "target", facts: { [rollValue]: 42 } }));
+  await run(store.apply(a, "test", second, 1, "strict"));
+  const item = await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 42 } }));
+  await run(store.apply(a, "test", first, 2, mode));
+  const holders = () => run(store.sql<{ entity_id: string }>`SELECT entity_id FROM live_unique WHERE account_id=${a}`);
+  if (mode === "rollout") {
+    expect(await holders()).toEqual([{ entity_id: item.id }]);
+    for (let i = 0; i < 3; i++) await run(store.runRolloutBatch(a, 1));
+    expect(await holders()).toEqual([]);
+    await drainRollout(store, a, 1);
+  } else {
+    expect(await run(store.rolloutStatus(a, 3))).toBeNull();
+  }
+  expect(await holders()).toEqual([{ entity_id: target.id }]);
+  await checkRollout(a, first);
+});
+
+test("stored ref projection follows type changes while a value is hidden", async () => {
+  const a = account();
+  const active = rolloutFixture(0);
+  const string = {
+    ...active,
+    attributes: active.attributes.map((attr) => (attr.key === rollLink ? { key: rollLink, type: "string" } : attr)),
+  };
+  const hiddenRef = rolloutFixture(8);
+  const hiddenString = { ...string, shapes: hiddenRef.shapes };
+  await run(store.apply(a, "test", string, 0));
+  const target = await run(store.mutate(a, "test", { shape: "target", facts: {} }));
+  await run(store.mutate(a, "test", { shape: "item", facts: { [rollLink]: target.id } }));
+  const invalid = "\u0000\ud800" + "x".repeat(3000);
+  const malformed = await run(store.mutate(a, "test", { shape: "item", facts: { [rollLink]: invalid } }));
+  await run(store.apply(a, "test", hiddenRef, 1));
+  await checkRollout(a, hiddenRef);
+  await run(store.remove(a, "test", target.id));
+  const failed = await run(Effect.flip(store.apply(a, "test", active, 2)));
+  expect(failed).toMatchObject({ _tag: "Conflict", issues: [{ field: `${malformed.id}.facts.${rollLink}` }] });
+  await run(store.apply(a, "test", hiddenString, 2));
+  await drainRollout(store, a);
+  await checkRollout(a, hiddenString);
+});
+
+test("a writer can claim a new unique slot before an existing value has been scanned", async () => {
+  const a = account();
+  await run(store.apply(a, "test", rolloutFixture(0), 0));
+  const incumbent = await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 4 } }));
+  await run(store.apply(a, "test", rolloutFixture(1), 1));
+  const writer = await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 4 } }));
+  await drainRollout(store, a);
+  expect((await run(store.getLive(a, incumbent.id))).violations).toEqual([{ attribute: rollValue, issue: "duplicate" }]);
+  expect((await run(store.getLive(a, writer.id))).violations).toEqual([]);
+  await checkRollout(a, rolloutFixture(1));
+});
+
+test("retargeting a restored ref resolves the existing record in the registry transaction", async () => {
+  const a = account();
+  const base = rolloutFixture(0);
+  const expanded = { ...base, shapes: [...base.shapes, { key: "other", attributes: [rollKeep] }] };
+  const string = {
+    ...expanded,
+    attributes: expanded.attributes.map((attr) => (attr.key === rollLink ? { key: rollLink, type: "string" } : attr)),
+  };
+  const hidden = { ...string, shapes: [...rolloutFixture(8).shapes, expanded.shapes[2]!] };
+  await run(store.apply(a, "test", string, 0));
+  const target = await run(store.mutate(a, "test", { shape: "other", facts: {} }));
+  const source = await run(store.mutate(a, "test", { shape: "item", facts: { [rollLink]: target.id } }));
+  await run(store.apply(a, "test", hidden, 1));
+  await run(store.apply(a, "test", expanded, 2));
+  await drainRollout(store, a);
+  expect((await run(store.getLive(a, source.id))).violations).toEqual([{ attribute: rollLink, issue: "dangling_reference" }]);
+  const corrected = {
+    ...expanded,
+    attributes: expanded.attributes.map((attr) => (attr.key === rollLink ? { ...attr, target: "other" } : attr)),
+  };
+  await run(store.apply(a, "test", corrected, 3));
+  expect((await run(store.getLive(a, source.id))).violations).toEqual([]);
+  expect((await run(store.referrers(a, target.id))).data).toEqual([{ entity_id: source.id, attribute: rollLink, on_delete: "block" }]);
+  const [violation] = (await run(store.listViolations(a, "resolved", rollLink, 0, 50))).data;
+  const [registry] = await run(store.sql<{ at: string }>`SELECT at FROM registry_versions WHERE account_id=${a} AND version=4`);
+  expect(violation?.resolved_at).toBe(registry?.at);
+});
+
+test("a strict apply replaces stale slot values when it supersedes a release", async () => {
+  const a = account();
+  await run(store.apply(a, "test", rolloutFixture(1), 0, "strict"));
+  const owner = await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 4 } }));
+  await run(store.apply(a, "test", rolloutFixture(0), 1));
+  await run(store.mutate(a, "test", { facts: { [rollValue]: 5 } }, owner.id));
+  await run(store.apply(a, "test", rolloutFixture(1), 2, "strict"));
+  expect(await run(store.rolloutStatus(a, 3))).toBeNull();
+  await checkRollout(a, rolloutFixture(1));
+  await run(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 4 } }));
+  expect(await run(Effect.flip(store.mutate(a, "test", { shape: "item", facts: { [rollValue]: 5 } })))).toMatchObject({ _tag: "Conflict" });
 });

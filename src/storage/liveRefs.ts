@@ -33,46 +33,49 @@ export function liveRefs(sql: SqlClient.SqlClient) {
           .map((ref) => issue(`facts.${ref.key}`, "Unknown reference")),
       );
     });
-  const update = (account: string, entity: Entity, keys: readonly string[], edges: Edges) =>
+  const update = (account: string, entity: Entity, keys: readonly string[], config: Compiled) =>
     Effect.gen(function* () {
       const rows: Row[] = [],
         removed: string[] = [];
       for (const attribute of keys) {
-        if (!edges.has(attribute)) continue;
+        if (!config.edges.has(attribute)) continue;
         const value = entity.facts[attribute];
         if (value === undefined) removed.push(attribute);
-        else rows.push({ account_id: account, entity_id: entity.id, attribute, target_id: String(value) });
+        else rows.push({ account_id: account, entity_id: entity.id, attribute, target_id: config.storedRefTarget(value) });
       }
       if (removed.length)
         yield* sql`DELETE FROM live_refs
         WHERE account_id=${account} AND entity_id=${entity.id} AND attribute IN ${sql.in(removed)}`;
       if (rows[0]) yield* insert([rows[0], ...rows.slice(1)]);
     });
-  const incoming = (account: string, target: string, compiled: Compiled) =>
-    sql<Incoming & { shape: string }>`SELECT r.entity_id,r.attribute,e.document::jsonb->>'shape' AS shape
+  const incoming = (account: string, target: string, targetShape: string, compiled: Compiled) =>
+    sql<Incoming & { shape: string }>`SELECT r.entity_id,r.attribute,c.shape
       FROM live_refs r JOIN entities e ON e.account_id=r.account_id AND e.id=r.entity_id
-      WHERE r.account_id=${account} AND r.target_id=${target} AND NOT e.deleted
+      JOIN events c ON c.account_id=e.account_id AND c.entity_id=e.id AND c.kind='create'
+      WHERE r.account_id=${account} AND r.target_id=${target} AND length(r.target_id)=24 AND NOT e.deleted
       ORDER BY r.entity_id COLLATE "C", r.attribute`.pipe(
       Effect.map((rows) =>
         rows.flatMap(({ shape, ...row }) => {
           const edge = compiled.edges.get(row.attribute);
-          return edge && compiled.members.get(shape)?.has(row.attribute) ? [{ ...row, on_delete: edge.on_delete }] : [];
+          return edge?.target === targetShape && compiled.members.get(shape)?.has(row.attribute)
+            ? [{ ...row, on_delete: edge.on_delete }]
+            : [];
         }),
       ),
     );
   // Called under apply's exclusive account lock, for stored facts of any shape.
-  const reconcile = (account: string, previous: Edges, desired: Edges, entities: Iterable<Entity>) =>
+  const reconcile = (account: string, previous: Edges, desired: Compiled, entities: Iterable<Entity>) =>
     Effect.gen(function* () {
-      const removed = [...previous.keys()].filter((key) => !desired.has(key));
+      const removed = [...previous.keys()].filter((key) => !desired.edges.has(key));
       if (removed.length) yield* sql`DELETE FROM live_refs WHERE account_id=${account} AND attribute IN ${sql.in(removed)}`;
-      const added = [...desired.keys()].filter((key) => !previous.has(key));
+      const added = [...desired.edges.keys()].filter((key) => !previous.has(key));
       if (!added.length) return;
       let batch: Row[] = [];
       for (const entity of entities)
         for (const attribute of added) {
           const target = entity.facts[attribute];
           if (target === undefined) continue;
-          batch.push({ account_id: account, entity_id: entity.id, attribute, target_id: String(target) });
+          batch.push({ account_id: account, entity_id: entity.id, attribute, target_id: desired.storedRefTarget(target) });
           if (batch.length === 1_000) {
             yield* insert([batch[0]!, ...batch.slice(1)]);
             batch = [];

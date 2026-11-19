@@ -9,7 +9,9 @@ export type ShapeImpact = {
 
 // A committed entity satisfies the current registry, so only stricter or
 // changed constraints can introduce violations. Removal also needs projection work.
-export function registryImpact(current: Registry, desired: Registry) {
+type Restored = (shape: string, attribute: string) => boolean;
+
+export function registryImpact(current: Registry, desired: Registry, restored: Restored = () => true) {
   const shapes = new Map<string, ShapeImpact>();
   const targets = new Set<string>();
   const attributes = new Map(current.attributes.map((a) => [a.key, a]));
@@ -32,6 +34,7 @@ export function registryImpact(current: Registry, desired: Registry) {
       if (!old) continue;
       const attr = nextAttributes.get(key);
       const visible = before.attributes.includes(key);
+      if (!visible && !restored(before.key, key)) continue;
       if (!visible || old.type !== attr?.type || canonical(old.values ?? null) !== canonical(attr?.values ?? null)) impact.fields.add(key);
       if (attr?.unique && (!visible || !old.unique)) recheckUnique.add(key);
       const edge = desiredEdges.get(key);
@@ -55,7 +58,7 @@ export function registryImpact(current: Registry, desired: Registry) {
 
 export type RegistryImpact = ReturnType<typeof registryImpact>;
 
-export function slotChanges(current: Registry, desired: Registry) {
+export function slotChanges(current: Registry, desired: Registry, restored: Restored = () => true) {
   const before = new Set(current.attributes.filter((a) => a.unique).map((a) => a.key));
   const after = new Set(desired.attributes.filter((a) => a.unique).map((a) => a.key));
   const previousShapes = new Map(current.shapes.map((s) => [s.key, s.attributes]));
@@ -64,8 +67,21 @@ export function slotChanges(current: Registry, desired: Registry) {
   for (const [shape, oldMembers] of previousShapes) {
     const nextMembers = nextShapes.get(shape) ?? [];
     const release = oldMembers.filter((key) => before.has(key) && (!after.has(key) || !nextMembers.includes(key)));
-    const claim = nextMembers.filter((key) => after.has(key) && (!before.has(key) || !oldMembers.includes(key)));
+    const claim = nextMembers.filter((key) => after.has(key) && (oldMembers.includes(key) ? !before.has(key) : restored(shape, key)));
     if (release.length || claim.length) changes.set(shape, { release, claim });
   }
   return changes;
+}
+
+export function possibleRestorations(current: Registry, desired: Registry) {
+  const attributes = new Set(current.attributes.map(({ key }) => key));
+  const shapes = new Map(current.shapes.map(({ key, attributes }) => [key, new Set(attributes)]));
+  const candidates = new Map<string, Set<string>>();
+  for (const shape of desired.shapes) {
+    const previous = shapes.get(shape.key);
+    if (!previous) continue;
+    const added = shape.attributes.filter((key) => attributes.has(key) && !previous.has(key));
+    if (added.length) candidates.set(shape.key, new Set(added));
+  }
+  return candidates;
 }

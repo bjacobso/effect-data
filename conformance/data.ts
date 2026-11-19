@@ -106,7 +106,8 @@ const REGISTRY = { attributes: ATTRS, shapes: [EMPLOYEE, CONTRACTOR], policies: 
 const CORE_KEYS = ["version", "attributes", "shapes", "policies", "automations"];
 const known = Effect.fnUntraced(function* (doc: typeof Registry.Type, ctx: string) {
   for (const [k, v] of Object.entries(doc ?? {}))
-    if (!CORE_KEYS.includes(k)) yield* check(Array.isArray(v) && v.length === 0, `${ctx}: extra collection ${k} must be []`, v);
+    if (!CORE_KEYS.includes(k) && k !== "rollout")
+      yield* check(Array.isArray(v) && v.length === 0, `${ctx}: extra collection ${k} must be []`, v);
   return Object.fromEntries(Object.entries(doc ?? {}).filter(([k]) => CORE_KEYS.includes(k)));
 });
 const getReg = (account: string) => req(Registry, "GET", "/v2/registry", { account });
@@ -296,7 +297,10 @@ test(
       "no-op plan",
     );
     const desired = {
-      attributes: [...ATTRS.filter((x) => x.key !== "employee/level"), { key: "employee/title", type: "string" }],
+      attributes: [
+        ...ATTRS.map((x) => (x.key === "employee/level" ? { ...x, retired: true } : x)),
+        { key: "employee/title", type: "string" },
+      ],
       shapes: [{ ...EMPLOYEE, attributes: [...EMPLOYEE.attributes.filter((k) => k !== "employee/level"), "employee/title"] }],
       policies: [POLICIES[0], { ...POLICIES[1], name: "Non-solicit agreement" }],
       automations: AUTOMATIONS,
@@ -307,7 +311,7 @@ test(
     yield* eqJ(
       (yield* p.body).changes,
       [
-        { kind: "attribute", key: "employee/level", change: "removed" },
+        { kind: "attribute", key: "employee/level", change: "modified" },
         { kind: "attribute", key: "employee/title", change: "added" },
         { kind: "attribute", key: "person/nickname", change: "modified" },
         { kind: "shape", key: "contractor", change: "removed" },
@@ -322,13 +326,13 @@ test(
 );
 
 test(
-  "impact: removing an attribute shows every dependent document",
+  "impact: retiring an attribute shows every dependent document",
   Effect.gen(function* () {
     const a = newAccount();
     yield* putOk(a, 0, REGISTRY);
     const desired = {
       ...REGISTRY,
-      attributes: ATTRS.filter((x) => x.key !== "employee/work_state"),
+      attributes: ATTRS.map((x) => (x.key === "employee/work_state" ? { ...x, retired: true } : x)),
       shapes: [{ ...EMPLOYEE, attributes: EMPLOYEE.attributes.filter((k) => k !== "employee/work_state") }, CONTRACTOR],
     };
     const p = yield* plan(a, desired);
@@ -337,7 +341,7 @@ test(
     yield* eqJ(
       (yield* p.body).issues.map((i) => i.field),
       ["policies[0].applies_when.fact", "automations[0].on.changed[0]", "automations[0].when.fact"],
-      "every reference to the removed attribute",
+      "every reference to the retired attribute",
     );
     yield* expectError(yield* put(a, 1, desired), 422, "validation_failed", "PUT refuses");
   }),
@@ -372,7 +376,8 @@ test(
     yield* check(TS_RE.test(e.created_at) && e.created_at === e.updated_at, "timestamps", e);
     const g = yield* req(Entity, "GET", `/v2/entities/${e.id}`, { account: a });
     yield* eqJ(g.status, 200, "GET");
-    yield* same(yield* g.body, Object.fromEntries(Object.entries(e).filter(([k]) => k !== "effects")), "GET equals create minus effects");
+    const { effects: _, ...created } = e;
+    yield* same(yield* g.body, { ...created, violations: [] }, "GET includes open violations");
     yield* expectError(yield* req(Entity, "GET", `/v2/entities/${e.id}`, { account: newAccount() }), 404, "not_found", "other account");
     const bad: [[string, object], string][] = [
       [["manager", { "person/email": "b@x.co" }], "shape"],
@@ -672,7 +677,7 @@ test(
       "lowest id keeps the value",
     );
     yield* eqJ((yield* p.body).applicable, false, "not applicable");
-    const e = yield* expectError(yield* put(a, 1, desired), 409, "conflict", "PUT with violations");
+    const e = yield* expectError(yield* put(a, 1, { ...desired, mode: "strict" }), 409, "conflict", "PUT with violations");
     yield* same(fieldsOf(e).sort(), expected.map((v) => `${v.entity_id}.${v.field}`).sort(), "PUT details");
     // Removing attributes from the shape hides their facts without editing history.
     const shrink = {

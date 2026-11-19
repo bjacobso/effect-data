@@ -263,7 +263,7 @@ describe("registry pipeline", () => {
     const source = entity({ "x/link": target.id });
     const plan = app.plan(r, { ...r, shapes: r.shapes.slice(0, 1) }, [source, target]);
     expect(plan.issues.map((x) => x.field)).toEqual(["attributes[1].target"]);
-    expect(plan.violations).toEqual([{ entity_id: source.id, field: "facts.x/link", issue: "Dangling reference" }]);
+    expect(plan.violations).toEqual([{ entity_id: source.id, field: "facts.x/link", issue: "Dangling reference", blocking: true }]);
   });
   test("unresolved refs suppress dependent checks; issues preserve field order", () => {
     const r = fixture();

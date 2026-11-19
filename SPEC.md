@@ -10,7 +10,7 @@ the behaviour it describes.
   and this file must be brought back into agreement; PLAN.md is not edited
   after its pass lands.
 
-Status: through **Pass 6, soft removal**. Packs: `onboarding`,
+Status: through **Pass 6** (soft removal and background rollout). Packs: `onboarding`,
 `certification`.
 
 ## 1. Model
@@ -56,7 +56,7 @@ certification_requirements (35, certification), automations (40).
 | `values` | enum only, required for enum: 1–100 unique strings of 1–200 code points |
 | `label` | 1–200 code points |
 | `unique` | boolean; uniqueness spans live entities of every shape |
-| `retired` | optional literal `true`; unavailable to shapes, rules and actions |
+| `retired` | optional literal `true` makes the attribute unavailable to shapes, rules and actions |
 | `target` | ref only, required for ref: a shape key (a reference) |
 | `on_delete` | ref only, optional: `block` (default when absent) or `clear` |
 
@@ -124,13 +124,28 @@ Issues are ordered by kind order, then index, then the kind's field order.
   missing required,
   value no longer decodes, duplicate of a now-unique value (reported on every
   entity but the lowest id), `shape` removed, and ref values that no longer
-  name a live entity of the target shape ("Dangling reference"). Sorted by
-  entity id, then field.
-- `PUT /v2/registry` requires `base_version`: stale → 409; issues → 422;
-  violations → 409 with details `<entity_id>.<field>`; otherwise 200. Apply
-  hides facts for attributes removed from a live entity's shape. Putting a
-  member back restores its facts. Apply releases hidden unique slots before
-  claiming new slots, all within the registry transaction.
+  name a live entity of the target shape ("Dangling reference"). Each entry
+  includes `blocking` for the requested mode. Entries are sorted by entity
+  id, then field. `applicable` is true when there are no issues or blocking
+  violations.
+- In rollout mode duplicate values and dangling refs restored by a membership
+  change can become records. Missing required facts, values that fail decoding,
+  removing a shape with live entities and newly invalid refs that were already
+  visible when their definition changed block in both modes.
+- `PUT /v2/registry` requires `base_version` and accepts the same `mode`.
+  Stale → 409, issues → 422, blocking violations → 409 with details
+  `<entity_id>.<field>`, otherwise 200. Apply hides facts for attributes
+  removed from a live entity's shape. Putting a member back restores its facts.
+  Strict applies release hidden or no-longer-unique slots and then claim new
+  slots before committing. Rollout applies commit the registry and a job
+  together and the job performs all its releases before its claims.
+- A later successful apply supersedes the running rollout and carries its
+  unfinished scope forward. A strict apply reconciles that scope before
+  commit and starts no job. `GET /v2/registry` returns
+  `rollout: { version, status, processed, total } | null` for the returned
+  version. `processed` counts entities visited during the claim phase.
+  `total` is zero until the worker counts the scope and reflects the final
+  processed count when done. A rollout with empty scope is immediately done.
 - Every previously applied attribute key must remain in the document. Omission
   is a 422 issue at `attributes` naming the key. Retiring and unretiring an
   attribute preserve the rest of its definition. A retired definition is frozen.
@@ -182,14 +197,20 @@ effect-data specifics:
   attribute, op, value, reason, actor }] }` ordered by tx then attribute.
   `reason` is `api | automation | migration | reference`. Readable after
   deletion. Registry applies add no history rows.
-- Unique collisions with any live entity of any shape → 409 at
-  `facts.<key>`.
+- Changing a unique value claims its slot immediately. A held slot
+  collides across shapes → 409 at `facts.<key>`. During a rollout a writer
+  can claim a slot before an existing entity with that value has been
+  reconciled. An unchanged duplicate or dangling reference may remain while
+  other facts are patched.
+- Entity GET responses include `violations: [{ attribute, issue }]` ordered
+  by attribute and issue. Current reads list open records. Historical reads
+  list records open at the requested time.
 
 ## 5. Refs
 
 ### 5.1 Integrity on write
 
-On create, PATCH and automation `set`, every ref value must name a **live
+On create, PATCH and automation `set`, every newly set ref value must name a **live
 entity of the attribute's target shape** in the same account; otherwise 422 at
 `facts.<key>` ("Unknown reference"). A self-reference is allowed. An
 automation `set` that fails this fails the whole request and rolls back its
@@ -216,7 +237,8 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
 ### 5.4 Impact and history
 
 Hidden refs are excluded from delete blocking, clearing and referrer listings.
-An apply that restores a ref checks its target against live entities.
+An apply that restores a ref checks its target against live entities. A
+restored dangling ref blocks a strict apply or becomes a rollout violation.
 
 - `GET /v2/entities/{id}/referrers` → `{ data: [{ entity_id, attribute,
   on_delete }] }` for live referrers, sorted by entity id then attribute; 404
@@ -241,6 +263,29 @@ An apply that restores a ref checks its target against live entities.
   `next_after` is the last seq returned, or `null` for an empty page.
 - `effects` on create/PATCH responses lists every action executed, in order,
   with `automation_id`.
+
+### 6.1 Violation records
+
+- The rollout opens `duplicate` records for non-holders of a visible unique
+  value and `dangling_reference` records for visible refs with an invalid
+  target. A current slot holder wins. Among competing claims in a batch, the
+  lowest entity id wins. At most one record per entity, attribute and issue
+  is open at once.
+- A value change or retraction resolves its records. Deletion resolves
+  all of an entity's records. When a writer releases a slot, the lowest-id
+  eligible open duplicate claims it and its duplicate record resolves in
+  the same transaction. A ref retarget that repairs a record resolves it
+  on apply. The rollout resolves records made obsolete by visibility and
+  uniqueness changes.
+- Opening and resolving records append outbox items with `automation_id: null`,
+  `op: "violation_opened" | "violation_resolved"`, `violation_id`, `attribute`
+  and `issue`. These changes do not trigger automations or add facts.
+- `GET /v2/violations?status=open|resolved&attribute=&after=&limit=` returns
+  `{ data, next_after }` ordered by numeric record id, with the same cursor
+  and limit conventions as the outbox. Optional filters match status and
+  attribute. Each record contains `id`, `entity_id`, `attribute`, `issue`,
+  `value`, `status`, `registry_version`, `opened_tx`, `opened_at`,
+  `resolved_tx` and `resolved_at`. The last two fields are null while open.
 
 ## 7. Pack routes
 
@@ -270,6 +315,7 @@ An apply that restores a ref checks its target against live entities.
 | GET | `/v2/entities/{id}/history` | |
 | GET | `/v2/entities/{id}/referrers` | |
 | GET | `/v2/outbox` | |
+| GET | `/v2/violations` | |
 | POST | `/v2/entities/{id}/evaluate` | onboarding pack |
 | POST | `/v2/entities/{id}/certifications` | certification pack |
 
@@ -284,8 +330,9 @@ An apply that restores a ref checks its target against live entities.
 ## 9. Storage guarantees
 
 - `facts` and `events` are append-only (triggers reject UPDATE and DELETE).
-  `entities`, `live_unique` and `live_refs` are projections updated in the
-  same transaction as the facts.
+  Entity writes maintain `entities`, `live_unique` and `live_refs` in
+  the same transaction as the facts. Registry rollouts reconcile the
+  uniqueness projection and violation records in background transactions.
 - Registry versions are recorded on apply. The registry-history migration
   captures the current document for existing accounts at backfill time.
 - `live_refs` projects stored ref facts, including hidden values, using the
@@ -299,11 +346,13 @@ An apply that restores a ref checks its target against live entities.
   index, not check-then-insert.
 - Registry apply takes no per-value advisory locks. Its exclusive account
   lock guards changes to the live uniqueness projection.
-- Known limits, measured in REPORT.md Pass 5 at 1M live entities: attaching
-  an optional member held the exclusive account lock for 2.21 ms, enabling
-  uniqueness for 37.47 s. Apply now preserves the stored values of removed
-  members. The exclusive lock blocks all writes to that account. `as_of` replays an entity's full
-  history.
+- A worker reconciles at most 1,000 creation ids per transaction under the
+  shared account lock. A locked job row and its committed phase and cursor
+  allow one worker at a time per account and recovery after restart.
+- Known limits: A hidden unique value can still block a new claim until the
+  release phase reaches its old holder. Hidden values stay in the stored
+  projection and there is no purge. Ref type changes and strict slot writes
+  take the exclusive account lock. `as_of` replays the entity's full history.
 
 ## 10. Composition
 
@@ -315,4 +364,4 @@ another.
 ## 11. Not yet specified
 
 - Queries (deferred; effect-data stays standalone from Triplex).
-- Staged or online registry migration.
+- Purge of hidden facts and rolling out blocking schema changes.

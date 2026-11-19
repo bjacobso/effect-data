@@ -110,7 +110,7 @@ test(
     const r2 = yield* putOk(a, 1, REGISTRY);
     yield* same(
       yield* (yield* req(CertRegistry, "GET", "/v2/registry", { account: a })).body,
-      { version: 2, ...REGISTRY },
+      { version: 2, ...REGISTRY, rollout: { version: 2, status: "done", processed: 0, total: 0 } },
       "full round-trip",
     );
     yield* eqJ(r2.version, 2, "version");
@@ -194,7 +194,7 @@ test(
 );
 
 test(
-  "impact: removing a requirement or its expiry attribute",
+  "impact: removing a requirement or retiring its expiry attribute",
   Effect.gen(function* () {
     const a = newAccount();
     yield* putOk(a, 0, REGISTRY);
@@ -207,7 +207,7 @@ test(
     yield* same((yield* p1.body).changes, [{ kind: "certification_requirement", key: "forklift", change: "removed" }], "change kind name");
     const noForklift = {
       ...REGISTRY,
-      attributes: ATTRS.filter((x) => x.key !== "cert/forklift_expires"),
+      attributes: ATTRS.map((x) => (x.key === "cert/forklift_expires" ? { ...x, retired: true } : x)),
       shapes: [{ ...EMPLOYEE, attributes: EMPLOYEE.attributes.filter((k) => k !== "cert/forklift_expires") }, VISITOR],
     };
     const p2 = yield* plan(a, noForklift);

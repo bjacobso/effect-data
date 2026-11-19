@@ -124,6 +124,7 @@ const Attribute = Schema.Struct({
   values: Schema.optionalKey(strings),
   label: Schema.optionalKey(Schema.String),
   unique: Schema.optionalKey(Schema.Boolean),
+  retired: Schema.optionalKey(Schema.Literal(true)),
   target: Schema.optionalKey(Schema.String),
   on_delete: Schema.optionalKey(Schema.Literals(["block", "clear"])),
 });
@@ -155,8 +156,17 @@ const Requirement = Schema.Struct({
   renew_within_days: Schema.Int,
   applies_when: Schema.optionalKey(Schema.Json),
 });
+const rollout = Schema.NullOr(
+  Schema.Struct({
+    version: Schema.Int,
+    status: Schema.Literals(["running", "done", "superseded"]),
+    total: Schema.Int,
+    processed: Schema.Int,
+  }),
+);
 const registryFields = {
   version: Schema.Int,
+  rollout: Schema.optionalKey(rollout),
   attributes: Schema.Array(Attribute),
   shapes: Schema.Array(Shape),
   policies: Schema.Array(Policy),
@@ -176,9 +186,9 @@ export const Plan = Schema.Struct({
       change: Schema.Literals(["added", "removed", "modified"]),
     }),
   ),
-  violations: Schema.Array(Schema.Struct({ entity_id: Schema.String, ...Issue.fields })),
+  violations: Schema.Array(Schema.Struct({ entity_id: Schema.String, ...Issue.fields, blocking: Schema.Boolean })),
 });
-export const Entity = Schema.Struct({
+const EntityFields = Schema.Struct({
   id: Schema.String,
   shape: Schema.String,
   facts: Schema.Record(Schema.String, Scalar),
@@ -187,8 +197,28 @@ export const Entity = Schema.Struct({
   created_at: Schema.String,
   updated_at: Schema.String,
 });
+const ViolationIssue = Schema.Literals(["duplicate", "dangling_reference"]);
+const OpenViolation = Schema.Struct({ attribute: Schema.String, issue: ViolationIssue });
+export const Entity = Schema.Struct({ ...EntityFields.fields, violations: Schema.Array(OpenViolation) });
+export const Violations = Schema.Struct({
+  data: Schema.Array(
+    Schema.Struct({
+      ...OpenViolation.fields,
+      id: Schema.Int,
+      entity_id: Schema.String,
+      value: Scalar,
+      status: Schema.Literals(["open", "resolved"]),
+      registry_version: Schema.Int,
+      opened_tx: Schema.Int,
+      opened_at: Schema.String,
+      resolved_tx: Schema.NullOr(Schema.Int),
+      resolved_at: Schema.NullOr(Schema.String),
+    }),
+  ),
+  next_after: Schema.NullOr(Schema.Int),
+});
 export const Mutation = Schema.Struct({
-  ...Entity.fields,
+  ...EntityFields.fields,
   effects: Schema.Array(Schema.Struct({ automation_id: Schema.String, ...Action.fields })),
 });
 export const History = Schema.Struct({
@@ -210,7 +240,9 @@ export const Outbox = Schema.Struct({
       seq: Schema.Int,
       at: Schema.String,
       entity_id: Schema.String,
-      automation_id: Schema.String,
+      automation_id: Schema.NullOr(Schema.String),
+      violation_id: Schema.optionalKey(Schema.Int),
+      issue: Schema.optionalKey(ViolationIssue),
       ...Action.fields,
     }),
   ),

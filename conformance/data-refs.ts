@@ -240,7 +240,7 @@ test(
     const convert = yield* (yield* plan(account, fixture)).body;
     yield* same(
       convert.violations,
-      [{ entity_id: bad.id, field: "facts.edge/block", issue: "Dangling reference" }],
+      [{ entity_id: bad.id, field: "facts.edge/block", issue: "Dangling reference", blocking: true }],
       "legacy string with no live target",
     );
     yield* (yield* patch(account, bad.id, { "edge/block": null })).body;
@@ -255,7 +255,7 @@ test(
       ...fixture,
       attributes: fixture.attributes.map((attr) => (attr.key === "edge/block" ? { ...attr, target: "other" } : attr)),
     };
-    const expected = [{ entity_id: source.id, field: "facts.edge/block", issue: "Dangling reference" }];
+    const expected = [{ entity_id: source.id, field: "facts.edge/block", issue: "Dangling reference", blocking: true }];
     yield* same((yield* (yield* plan(account, retarget)).body).violations, expected, "target shape change breaks existing fact");
     const rejected = yield* expectError(yield* put(account, retarget, 2), 409, "conflict", "reject incompatible retarget");
     yield* same(rejected.details, [{ field: `${source.id}.facts.edge/block`, issue: "Dangling reference" }], "apply details");

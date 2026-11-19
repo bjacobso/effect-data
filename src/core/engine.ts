@@ -17,10 +17,12 @@ import {
 } from "./model.ts";
 import { attributeEdges } from "./kinds.ts";
 import { evaluator } from "./rules.ts";
-import { valueSchema } from "./values.ts";
+import { storedRefTarget, valueSchema } from "./values.ts";
 import { KindRegistry, type RegisteredKind } from "./registry.ts";
 import type { RegistryImpact } from "./registryImpact.ts";
 import { reviewIssues, type EntityReview, type Violation } from "./registryReview.ts";
+
+export type ApplyMode = "rollout" | "strict";
 
 const entitySchema = (attributes: ReadonlyMap<string, Schema.Codec<unknown>>, shape: Shape, keys: Iterable<string>) =>
   Schema.Struct(
@@ -37,6 +39,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
   const payload = (requiredBase = false) =>
     Schema.Struct({
       ...Object.fromEntries(Object.entries(fields).map(([key, schema]) => [key, Schema.optionalKey(schema)])),
+      mode: Schema.optionalKey(Schema.Literals(["rollout", "strict"])),
       base_version: requiredBase
         ? Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
         : Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
@@ -95,14 +98,21 @@ export function engine(kinds: readonly RegisteredKind[]) {
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
     const reactions = new Map<string, Automation[]>();
     for (const d of r.automations ?? []) for (const key of d.on.changed) reactions.set(key, [...(reactions.get(key) ?? []), d]);
-    return { schemas, attributes, members, visible, unique, rules, reactions, edges: attributeEdges(r.attributes ?? []) };
+    return { schemas, attributes, members, visible, unique, rules, reactions, storedRefTarget, edges: attributeEdges(r.attributes ?? []) };
   }
   function validate(r: Registry, shape: string, facts: Facts): Issue[] {
     const s = findShape(r, shape);
     if (!s) return [issue("shape", "Unknown shape")];
     return decodeIssues(compile(r).schemas.get(shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue));
   }
-  function preparePlan(current: Registry, desired: Registry, version: number, phase?: (name: string) => void, scope?: RegistryImpact) {
+  function preparePlan(
+    current: Registry,
+    desired: Registry,
+    version: number,
+    phase?: (name: string) => void,
+    scope?: RegistryImpact,
+    mode: ApplyMode = "strict",
+  ) {
     phase?.("registry checks and diff");
     current = normalize(current);
     desired = normalize(desired);
@@ -131,6 +141,8 @@ export function engine(kinds: readonly RegisteredKind[]) {
     issues.unshift(...retirement);
     const valid = !issues.length;
     const edges = attributeEdges(desired.attributes);
+    const oldEdges = attributeEdges(current.attributes);
+    const oldMembers = new Map(current.shapes.map((s) => [s.key, new Set(s.attributes)]));
     const shapes = new Map(desired.shapes.map((s) => [s.key, s]));
     const schemas = new Map<string, Schema.Codec<Facts>>();
     if (valid && (!scope || [...scope.shapes.values()].some((impact) => impact.fields.size))) {
@@ -157,7 +169,13 @@ export function engine(kinds: readonly RegisteredKind[]) {
       for (const [key, value] of Object.entries(e.facts)) {
         if (!accepted.has(key)) continue;
         if (schema && (!impact || impact.fields.has(key))) fields[key] = value;
-        if (refKeys.has(key)) refs.push({ key, value, target: edges.get(key)!.target });
+        if (refKeys.has(key))
+          refs.push({
+            key,
+            value,
+            target: edges.get(key)!.target,
+            deferred: !oldMembers.get(e.shape)?.has(key) || canonical(oldEdges.get(key) ?? null) === canonical(edges.get(key)),
+          });
         if (uniqueKeys.has(key)) slots.push({ key, identity: canonical([key, value]) });
       }
       const errors = schema ? decodeIssues(schema, fields).map((x) => issue(`facts.${x.field}`, x.issue)) : [];
@@ -166,10 +184,12 @@ export function engine(kinds: readonly RegisteredKind[]) {
     const finish = (violations: Violation[]) => ({
       from_version: version,
       to_version: version + 1,
-      applicable: !issues.length && !violations.length,
+      applicable: !issues.length && !violations.some((v) => mode === "strict" || !v.deferred),
       issues,
       changes,
-      violations: violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field)),
+      violations: violations
+        .sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field))
+        .map(({ deferred, ...v }) => ({ ...v, blocking: mode === "strict" || !deferred })),
     });
     return { issues, finish, inspect, shapes, hasRefs: edges.size > 0, hasUnique: unique.size > 0 };
   }
@@ -180,8 +200,9 @@ export function engine(kinds: readonly RegisteredKind[]) {
     version = 0,
     phase?: (name: string) => void,
     scope?: { impact: RegistryImpact; targets: ReadonlyMap<string, string> },
+    mode: ApplyMode = "strict",
   ) {
-    const prepared = preparePlan(current, desired, version, phase, scope?.impact);
+    const prepared = preparePlan(current, desired, version, phase, scope?.impact, mode);
     phase?.("entity revalidation");
     const targets =
       scope?.targets ?? new Map(prepared.hasRefs ? live.filter((e) => prepared.shapes.has(e.shape)).map((e) => [e.id, e.shape]) : []);

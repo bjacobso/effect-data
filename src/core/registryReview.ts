@@ -1,9 +1,10 @@
 import { compare, issue, type Entity, type Issue, type Value } from "./model.ts";
 
-export type Violation = Issue & { entity_id: string };
+export type ViolationIssue = "duplicate" | "dangling_reference";
+export type Violation = Issue & { entity_id: string; deferred?: ViolationIssue };
 export type EntityReview = {
   issues: Issue[];
-  refs: { key: string; value: Value; target: string }[];
+  refs: { key: string; value: Value; target: string; deferred: boolean }[];
   slots: { key: string; identity: string }[];
 };
 
@@ -13,15 +14,16 @@ export function reviewIssues(
   targets: ReadonlyMap<string, string>,
   duplicate: (identity: string) => boolean,
 ): Violation[] {
-  const errors = [...review.issues];
-  for (const { key, value, target } of review.refs)
+  const errors: (Issue & { deferred?: ViolationIssue })[] = [...review.issues];
+  for (const { key, value, target, deferred } of review.refs)
     if (typeof value !== "string" || targets.get(value) !== target) {
       const field = `facts.${key}`;
       const existing = errors.findIndex((x) => x.field === field);
       if (existing >= 0) errors.splice(existing, 1);
-      errors.push(issue(field, "Dangling reference"));
+      errors.push({ ...issue(field, "Dangling reference"), ...(deferred && existing < 0 ? { deferred: "dangling_reference" } : {}) });
     }
-  for (const { key, identity } of review.slots) if (duplicate(identity)) errors.push(issue(`facts.${key}`, "Duplicate unique value"));
+  for (const { key, identity } of review.slots)
+    if (duplicate(identity)) errors.push({ ...issue(`facts.${key}`, "Duplicate unique value"), deferred: "duplicate" });
   return errors.map((x) => ({ entity_id: id, ...x }));
 }
 
