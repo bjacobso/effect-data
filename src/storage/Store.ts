@@ -37,6 +37,10 @@ type Event = { tx: number; at: string; kind: string; shape: string; version: num
 type Step = { entity: Entity; keys: string[]; before: Facts; actor: string; reason: string; kind: string };
 type Delivery = { index: number; entity_id: string; automation_id: string; action: Doc };
 export type Mutation = { shape?: string; facts: Record<string, unknown>; expected_version?: number };
+export const StoreProbe = Context.Reference<{ phase: (name: string) => void; rows?: (count: number) => void } | undefined>(
+  "data/StoreProbe",
+  { defaultValue: () => undefined },
+);
 export const makeStore = (hashOverride?: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient,
@@ -142,9 +146,13 @@ export const makeStore = (hashOverride?: string) =>
           .sort(compare);
         if (before && !keys.length && kind !== "delete") return before;
         const next = { ...entity, version: (before?.version ?? 0) + 1, created_at: before?.created_at ?? "" };
+        const probe = reason === "migration" ? undefined : yield* StoreProbe;
+        probe?.phase("uniqueness");
         if (kind === "delete") yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
         else yield* unique(account, next, registry);
+        probe?.phase("edge update");
         if (edges.size) yield* refs.update(account, next, keys, edges);
+        probe?.phase("staging and automations");
         steps.push({ entity: next, keys, before: before?.facts ?? {}, actor, reason, kind });
         return next;
       });
@@ -152,8 +160,11 @@ export const makeStore = (hashOverride?: string) =>
       Effect.gen(function* () {
         const projections = new Map<string, Entity>();
         if (!steps.length) return projections;
+        const probe = yield* StoreProbe;
         // All validation and unique-value work precedes this short clock critical section.
+        probe?.phase("clock reserve");
         const allocation = yield* clock.reserve(account, steps.length);
+        probe?.phase("flush inserts and assembly");
         const events = steps.map((s, i) => {
           const at = new Date(allocation.ms + i + 1).toISOString(),
             created_at = s.entity.created_at || projections.get(s.entity.id)?.created_at || at;
@@ -210,11 +221,16 @@ export const makeStore = (hashOverride?: string) =>
     const mutate = (account: string, actor: string, body: Mutation, id?: string) =>
       writeTransaction(
         Effect.gen(function* () {
+          const probe = yield* StoreProbe;
+          probe?.phase("account lock");
           yield* lock(account);
-          const before = id ? yield* getLive(account, id, "write") : undefined,
-            { version, registry } = yield* getRegistry(account);
+          probe?.phase("entity read");
+          const before = id ? yield* getLive(account, id, "write") : undefined;
+          probe?.phase("registry read");
+          const { version, registry } = yield* getRegistry(account);
           if (before && body.expected_version !== undefined && before.version !== body.expected_version)
             return yield* Effect.fail(new Conflict({ issues: [] }));
+          probe?.phase("decode");
           const shape = before?.shape ?? body.shape ?? "",
             facts = merge(before?.facts ?? {}, body.facts),
             c = compiled(account, version, registry);
@@ -234,7 +250,9 @@ export const makeStore = (hashOverride?: string) =>
             created_at: "",
             updated_at: "",
           };
+          probe?.phase("ref validation");
           if (c.edges.size) yield* refs.validate(account, initial, c.edges);
+          probe?.phase("staging");
           let entity = yield* stage(steps, account, before, initial, registry, c.edges, actor, "api", before ? "write" : "create");
           const changed = Object.keys({ ...before?.facts, ...facts }).filter(
             (k) => canonical(before?.facts[k] ?? null) !== canonical(facts[k] ?? null),
@@ -261,20 +279,26 @@ export const makeStore = (hashOverride?: string) =>
                 } else deliveries.push({ index: steps.length - 1, entity_id: entity.id, automation_id: a.id, action: instruction.payload });
               }
           const committed = yield* flush(account, steps, deliveries);
+          probe?.phase("transaction completion");
           return { ...(committed.get(entity.id) ?? entity), effects };
         }),
       );
     const apply = (account: string, actor: string, desired: Registry, base: number) =>
       sql.withTransaction(
         Effect.gen(function* () {
+          const probe = yield* StoreProbe;
           desired = app.normalize(desired);
+          probe?.phase("account lock");
           yield* lock(account, true);
+          probe?.phase("registry read");
           const current = yield* getRegistry(account);
           if (base !== current.version) return yield* Effect.fail(new Conflict({ issues: [] }));
+          probe?.phase("load and parse");
           const entities = yield* live(account),
-            result = app.plan(current.registry, desired, entities, current.version);
+            result = app.plan(current.registry, desired, entities, current.version, probe?.phase);
           yield* ensure(result.issues);
           yield* ensureApplicable(result.violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
+          probe?.phase("staging, uniqueness and edges");
           const steps: Step[] = [];
           const previous = compiled(account, current.version, current.registry).edges;
           // The desired version is not committed yet, so keep it out of the cache.
@@ -297,8 +321,10 @@ export const makeStore = (hashOverride?: string) =>
           }
           if (previous.size || edges.size) yield* refs.reconcile(account, previous, edges, retained());
           const version = current.version + 1;
+          probe?.phase("registry write");
           yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${JSON.stringify(desired)}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
           yield* flush(account, steps);
+          probe?.phase("transaction completion");
           return { version, ...desired };
         }),
       );
@@ -312,12 +338,16 @@ export const makeStore = (hashOverride?: string) =>
       });
     const asOf = (account: string, id: string, at: string) =>
       Effect.gen(function* () {
+        const probe = yield* StoreProbe;
+        probe?.phase("as_of SQL");
         const events = yield* sql<Event>`SELECT * FROM events WHERE account_id=${account} AND entity_id=${id} AND at<=${at} ORDER BY tx`,
           last = events.at(-1);
         if (!last || last.kind === "delete") return yield* Effect.fail(new NotFound());
         const rows =
             yield* sql<Fact>`SELECT attribute,op,value FROM facts WHERE account_id=${account} AND entity_id=${id} AND tx<=${last.tx} ORDER BY tx,attribute`,
           facts: Facts = {};
+        probe?.rows?.(events.length + rows.length);
+        probe?.phase("as_of replay");
         for (const r of rows)
           if (r.op === "assert") facts[r.attribute] = decodeValue(r.value);
           else delete facts[r.attribute];

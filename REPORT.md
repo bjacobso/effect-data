@@ -763,3 +763,107 @@ facts, entity projections and outbox rows now use bounded inserts inside the
 original transaction. The storage regression checks all 10,000 committed
 retractions and verifies that history and `as_of` replay across batch
 boundaries.
+
+### Pass 5 investigation
+
+The benchmark drives `Store` against the existing `onb_data_bench` database.
+The `bench_big` fixture has 1,000,000 live entities, 199 initial shape
+members, seven populated facts per entity and one live ref per entity. Each
+apply launches 16 one-shot PATCH requests to the same account when the
+exclusive lock is acquired. Lock time is measured from the lock statement's
+return through completion of the transaction. This includes the client-side
+completion of `COMMIT` or `ROLLBACK`. The SQL counters count statements
+dispatched through Effect's SQL statement transformer. The driver's
+transaction-control statements add one `BEGIN` and one `COMMIT` or
+`ROLLBACK` per attempt. Phase timings include client and server work between
+the instrumentation points.
+
+The make-unique apply had already rolled back on a 30,000-entity fixture
+with PostgreSQL's `out of shared memory` error. The advisory locks are held
+until transaction end. PostgreSQL was left at `max_locks_per_transaction=64`,
+`max_connections=100`, and `max_prepared_transactions=0`.
+
+In the supplemental 30,000-entity run, make-unique rolled back with the
+same error after 4.954 s and left the registry version and live unique slots
+untouched. Removal finished after 12.827 s. Its staging issued 60,000
+uniqueness deletes and its flush spent 8.256 s on assembly and inserts.
+[30,000-entity measurements](bench/results-pass5-investigation-30000.json)
+· [Node CPU profile](bench/pass5-investigation-30000.cpuprofile.gz)
+
+The 30,000-entity `--cpu-prof` profile attributes most attach-optional time
+to idle waits. The top active frames include Effect Schema's `stepProperty`,
+Effect's `fromIteratorEagerUnsafe` and `runSequential`, and the core's
+`compare`. During removal the two frames on `flush`'s `steps.findLast`
+lookup account for about 5.9 s of sampled time. With one migration step per
+entity, the lookup examines about 500 billion entries at one million
+retractions.
+
+#### One-million-entity apply phases
+
+Each cell gives milliseconds / statements. Rollback time falls in the last
+measured phase for make-unique.
+
+| Phase | Attach optional | Make unique (rollback) |
+| --- | ---: | ---: |
+| Start transaction | 0.276 / 0 | 0.765 / 0 |
+| Wait for account lock | 0.252 / 1 | 0.387 / 1 |
+| Read registry | 0.975 / 1 | 2.782 / 1 |
+| Load and parse live entities | 1,575.752 / 1 | 1,574.729 / 1 |
+| Registry checks and diff | 2.232 / 0 | 2.528 / 0 |
+| Entity revalidation | 20,185.055 / 0 | 21,182.785 / 0 |
+| Plan-to-stage overhead | 0.338 / 0 | 0.130 / 0 |
+| Staging, uniqueness and edges | 61,946.675 / 1,000,000 | 5,365.678 / 75,153 |
+| Registry write | 7.941 / 1 | — |
+| Transaction completion | 1.218 / 0 | — |
+
+- **H1 confirmed.** Attach-optional issued one `live_unique` `DELETE` per
+  entity, even without a unique attribute. Retractions called
+  it in both `stage` and the apply loop, measured at two per entity in the
+  30,000-entity run.
+- **H2 confirmed.** Registry checks and the diff took 2.2 ms for the
+  one-million-entity attach. Revalidation took 20.19 s, including sorting,
+  retained facts, references and Effect Schema decoding. The profile shows
+  property decoding among the top active frames.
+- **H3 confirmed.** Attach loaded and parsed a million documents in 1.58 s.
+  RSS crossed 1.02 GiB immediately after the load and peaked at 1.12 GiB.
+- **H4 confirmed.** For the attach, 83.720 s of the 83.721 s wall time fell
+  inside the exclusive lock. Same-account PATCH p50 and p99 were both about
+  83.75 s.
+
+The original one-million-entity removal was still holding the account lock
+after 22 minutes in projection assembly alone. The 30,000-entity profile
+above isolates that cost and the smaller run provides completed PATCH and
+replay measurements while the full removal runs.
+
+#### PATCH and `as_of` breakdown at 30,000 entities
+
+Average phase times in milliseconds. Each PATCH sent 10 statements plus
+`BEGIN` and `COMMIT`. The seven single-statement steps were account lock,
+entity read, registry read, ref validation, uniqueness, ref update and clock
+reservation. The flush sent three inserts.
+
+| PATCH phase | 1 worker | 16 workers, one account |
+| --- | ---: | ---: |
+| Transaction startup | 0.080 | 0.101 |
+| Account lock | 0.059 | 0.072 |
+| Entity read | 0.085 | 0.097 |
+| Registry read | 0.122 | 0.124 |
+| Decode | 0.039 | 0.029 |
+| Ref validation | 0.088 | 0.105 |
+| Staging and automations | 0.013 | 0.009 |
+| Uniqueness | 0.073 | 0.082 |
+| Ref update | 0.127 | 0.159 |
+| Clock reserve | 0.080 | 8.607 |
+| Flush | 0.272 | 0.367 |
+| Transaction completion | 0.156 | 0.226 |
+| Writes/s | 827 | 1,548 |
+| PATCH p50 / p99 (ms) | 1.154 / 2.730 | 6.192 / 48.255 |
+
+`as_of` uses two statements per read. SQL includes driver transfer and row
+decoding. Each latency used 30 samples.
+
+| History facts | SQL rows (events + facts) | Average SQL ms | Average replay ms | p50 / p99 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 14 | 0.245 | 0.004 | 0.233 / 0.419 |
+| 1,000 | 1,994 | 1.592 | 0.079 | 1.638 / 2.645 |
+| 10,000 | 19,994 | 12.784 | 0.703 | 13.205 / 14.635 |

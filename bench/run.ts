@@ -2,17 +2,20 @@ import { writeFile } from "node:fs/promises";
 import { cpus, totalmem } from "node:os";
 import { NodeRuntime } from "@effect/platform-node";
 import { PgClient } from "@effect/sql-pg";
-import { Effect, Layer, Redacted } from "effect";
+import { Cause, Effect, Exit, Layer, Redacted } from "effect";
 import { SqlClient } from "effect/sql";
 import { dataLayer } from "../src/composition.ts";
 import type { Registry } from "../src/core/model.ts";
 import { migrate } from "../src/Migrations.ts";
 import { Store } from "../src/storage/Store.ts";
+import { average, measure, measureExit } from "./timing.ts";
 
-const mode = process.env.BENCH_MODE ?? "baseline";
+const mode = process.env.BENCH_MODE ?? "pass5";
+const withRefs = mode !== "baseline";
+const step = process.env.BENCH_STEP ?? "investigation";
 const url = new URL(process.env.BENCH_DATABASE_URL ?? "postgres://localhost:5432/onb_data_bench");
-if (url.pathname !== "/onb_data_bench" || (mode !== "baseline" && mode !== "refs"))
-  throw new Error("Use the onb_data_bench database and BENCH_MODE=baseline or BENCH_MODE=refs");
+if (url.pathname !== "/onb_data_bench" || !["baseline", "refs", "pass5"].includes(mode))
+  throw new Error("Use the onb_data_bench database and BENCH_MODE=baseline, refs or pass5");
 
 const bigCount = Number(process.env.BENCH_ENTITIES ?? 1_000_000);
 const writesPerWorker = Number(process.env.BENCH_WRITES ?? 250);
@@ -28,7 +31,7 @@ const historySizes = [10, 1_000, 10_000];
 const historySamples = 30;
 const epoch = Date.UTC(2024, 0, 1);
 const entityId = (n: number) => `en_${String(n).padStart(21, "0")}`;
-const link = mode === "refs" ? { key: "bench/link", type: "ref", target: "bench" } : { key: "bench/link", type: "string" };
+const link = withRefs ? { key: "bench/link", type: "ref", target: "bench" } : { key: "bench/link", type: "string" };
 const populated: Registry["attributes"] = [
   link,
   { key: "bench/name", type: "string" },
@@ -90,7 +93,7 @@ const seed = Effect.fnUntraced(function* (account: string, count: number) {
         CROSS JOIN LATERAL jsonb_each(p.document::jsonb->'facts') f
         WHERE e.account_id=${account} AND e.tx BETWEEN ${start} AND ${end}
       `;
-        if (mode === "refs")
+        if (withRefs)
           yield* sql`
           INSERT INTO live_refs(account_id,entity_id,attribute,target_id)
           SELECT account_id,entity_id,'bench/link','en_' || lpad((tx % ${count} + 1)::text,21,'0')
@@ -135,11 +138,11 @@ const seed = Effect.fnUntraced(function* (account: string, count: number) {
   return snapshots;
 });
 
-const patchRun = Effect.fnUntraced(function* (spread: boolean) {
+const patchRun = Effect.fnUntraced(function* (spread: boolean, concurrency = workers) {
   const store = yield* Store;
   const run = (offset: number, count: number) =>
     Effect.forEach(
-      Array.from({ length: workers }, (_, i) => i),
+      Array.from({ length: concurrency }, (_, i) => i),
       (worker) =>
         Effect.forEach(
           Array.from({ length: count }, (_, i) => i + offset),
@@ -151,85 +154,140 @@ const patchRun = Effect.fnUntraced(function* (spread: boolean) {
               // through those 25 visits the target toggles for every source.
               const parity = spread ? Math.floor(write / 25) % 2 : write % 2;
               const target = entityId((spread ? smallCount : bigCount) - parity);
-              const start = performance.now();
-              const result = yield* store.mutate(account, "bench", { facts: { "bench/link": target } }, source);
-              if (result.facts["bench/link"] !== target) throw new Error("PATCH did not set the link");
-              return performance.now() - start;
+              const sample = yield* measure(store.mutate(account, "bench", { facts: { "bench/link": target } }, source));
+              if (sample.value.facts["bench/link"] !== target) throw new Error("PATCH did not set the link");
+              return sample;
             }),
         ),
-      { concurrency: workers },
+      { concurrency },
     );
   yield* run(0, 50);
   const start = performance.now();
   const samples = (yield* run(50, writesPerWorker)).flat();
   const wall = performance.now() - start;
-  return { writes: samples.length, wall_ms: wall, writes_per_second: (samples.length * 1_000) / wall, ...latencies(samples) };
+  return {
+    writes: samples.length,
+    wall_ms: wall,
+    writes_per_second: (samples.length * 1_000) / wall,
+    ...latencies(samples.map((s) => s.wall_ms)),
+    phases: average(samples.map((s) => s.phases)),
+  };
 });
 
 const benchmark = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Store;
   yield* migrate;
-  yield* sql`
-    CREATE FUNCTION observe_apply_lock() RETURNS double precision LANGUAGE plpgsql AS $$
-    DECLARE k bigint := hashtextextended('bench_big',0);
-      deadline timestamptz := clock_timestamp() + interval '15 seconds';
-      acquired timestamptz;
-    BEGIN
-      LOOP
-        IF EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND mode='ExclusiveLock' AND granted
-          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
-          AND classid=((k >> 32) & 4294967295)::oid AND objid=(k & 4294967295)::oid AND objsubid=1) THEN
-          acquired := coalesce(acquired,clock_timestamp());
-        ELSIF acquired IS NOT NULL THEN
-          RETURN extract(epoch FROM clock_timestamp()-acquired)*1000;
-        ELSIF clock_timestamp()>deadline THEN
-          RAISE EXCEPTION 'Timed account lock was not observed';
-        END IF;
-        PERFORM pg_sleep(0.001);
-      END LOOP;
-    END $$
-  `.unprepared;
   if ((yield* store.getRegistry(big)).version !== 0) throw new Error("Benchmark fixture must start empty");
   const snapshots = yield* seed(big, bigCount);
   yield* Effect.forEach(small, (account) => seed(account, smallCount), { concurrency: workers, discard: true });
   yield* sql`ANALYZE entities`;
   yield* sql`ANALYZE events`;
   yield* sql`ANALYZE facts`;
-  if (mode === "refs") yield* sql`ANALYZE live_refs`;
+  if (withRefs) yield* sql`ANALYZE live_refs`;
   console.log("Measuring PATCH throughput");
+  const single = yield* patchRun(false, 1);
   const busy = yield* patchRun(false);
   const spread = yield* patchRun(true);
-  console.log("Measuring registry apply");
-  const desired = { ...registry, shapes: [{ key: "bench", attributes: attributes.map(({ key }) => key) }] };
-  const [apply, locks] = yield* Effect.all(
-    [
-      Effect.gen(function* () {
-        yield* Effect.sleep("25 millis");
-        const start = performance.now();
-        const applied = yield* store.apply(big, "bench", desired, 1);
-        if (applied.version !== 2) throw new Error("Registry apply did not advance the version");
-        return performance.now() - start;
-      }),
-      sql<{ ms: number }>`SELECT observe_apply_lock() AS ms`,
-    ],
-    { concurrency: "unbounded" },
-  );
+  const attach = { ...registry, shapes: [{ key: "bench", attributes: attributes.map(({ key }) => key) }] };
+  const makeUnique = { ...attach, attributes: attributes.map((a) => (a.key === "bench/count" ? { ...a, unique: true } : a)) };
+  const remove = { ...attach, shapes: [{ key: "bench", attributes: attach.shapes[0]!.attributes.filter((key) => key !== "bench/state") }] };
+  const apply = {} as Record<string, unknown>;
+  const scenarios =
+    mode === "pass5"
+      ? ([
+          ["attach_optional", attach],
+          ["make_unique", makeUnique],
+          ["remove_populated", remove],
+        ] as const)
+      : ([["attach_optional", attach]] as const);
+  let version = 1;
+  for (const [i, [name, desired]] of scenarios.entries()) {
+    console.log(`Measuring registry apply: ${name}`);
+    let held!: () => void;
+    const granted = new Promise<void>((resolve) => {
+      held = resolve;
+    });
+    let lockStart = 0;
+    let rssAfterLoad = 0;
+    const [operation, concurrent] = yield* Effect.all(
+      [
+        measureExit(store.apply(big, "bench", desired, version), (phase, now) => {
+          if (phase === "registry read") {
+            lockStart = now;
+            held();
+          }
+          if (phase === "registry checks and diff") rssAfterLoad = process.memoryUsage.rss();
+        }),
+        Effect.promise(() => granted).pipe(
+          Effect.andThen(
+            Effect.forEach(
+              Array.from({ length: workers }, (_, j) => j),
+              (j) => measure(store.mutate(big, "bench", { facts: { "bench/flag": i % 2 === 0 } }, entityId(4 + j))),
+              { concurrency: workers },
+            ),
+          ),
+        ),
+      ],
+      { concurrency: "unbounded" },
+    );
+    let failure: string | undefined;
+    if (Exit.isSuccess(operation.exit)) {
+      if (operation.exit.value.version !== ++version) throw new Error("Registry apply did not advance the version");
+    } else {
+      const cause = operation.exit.cause;
+      if (step !== "investigation" || name !== "make_unique" || !Cause.pretty(cause).includes("out of shared memory"))
+        return yield* Effect.failCause(cause);
+      failure = "out of shared memory (PostgreSQL advisory lock table), rolled back";
+      if ((yield* store.getRegistry(big)).version !== version) throw new Error("Failed apply advanced the registry");
+      const [row] = yield* sql`SELECT 1 FROM live_unique WHERE account_id=${big} LIMIT 1`;
+      if (row) throw new Error("Failed apply left a uniqueness projection");
+    }
+    const result = {
+      ...(failure && { failure }),
+      wall_ms: operation.wall_ms,
+      exclusive_lock_ms: operation.end_ms - lockStart,
+      phases: operation.phases,
+      patch_during_apply: { samples: concurrent.length, ...latencies(concurrent.map((s) => s.wall_ms)) },
+      max_rss_kib: process.resourceUsage().maxRSS,
+      rss_after_load_bytes: rssAfterLoad,
+      lock_granted_monotonic_ms: lockStart,
+      start_monotonic_ms: operation.start_ms,
+      end_monotonic_ms: operation.end_ms,
+    };
+    console.log(JSON.stringify({ scenario: name, ...result }));
+    apply[name] = result;
+    if (name === "make_unique" && !failure) {
+      // Restore the pre-scenario registry and uniqueness projection so the
+      // removal alone determines work in the next apply. Preserve the CAS version.
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`DELETE FROM live_unique WHERE account_id=${big}`;
+          yield* sql`UPDATE registries SET document=${JSON.stringify(attach)} WHERE account_id=${big}`;
+        }),
+      );
+    }
+  }
   console.log("Measuring as_of latency");
   const as_of = yield* Effect.forEach(snapshots, ({ id, at, history_rows, version }) =>
     Effect.gen(function* () {
       const history = yield* store.history(big, id);
-      if (history.data.length !== history_rows) throw new Error(`Wrong history length for ${id}`);
+      if (history.data.filter((r) => r.at <= at).length !== history_rows) throw new Error(`Wrong history length for ${id}`);
       yield* store.asOf(big, id, at);
       const samples = yield* Effect.forEach(Array.from({ length: historySamples }), () =>
         Effect.gen(function* () {
-          const start = performance.now();
-          const entity = yield* store.asOf(big, id, at);
-          if (entity.version !== version) throw new Error(`Wrong replay version for ${id}`);
-          return performance.now() - start;
+          const sample = yield* measure(store.asOf(big, id, at));
+          if (sample.value.version !== version) throw new Error(`Wrong replay version for ${id}`);
+          return sample;
         }),
       );
-      return { history_rows, samples: samples.length, ...latencies(samples) };
+      return {
+        history_rows,
+        samples: samples.length,
+        ...latencies(samples.map((s) => s.wall_ms)),
+        sql_rows: samples[0]!.rows,
+        phases: average(samples.map((s) => s.phases)),
+      };
     }),
   );
   const [pg] = yield* sql<{ version: string }>`SHOW server_version`.pipe(
@@ -252,8 +310,8 @@ const benchmark = Effect.gen(function* () {
       workers,
       writes_per_worker: writesPerWorker,
     },
-    patch: { busy, spread },
-    apply: { wall_ms: apply, exclusive_lock_ms: Number(locks[0]!.ms) },
+    patch: { single, busy, spread },
+    apply,
     as_of,
   };
 });
@@ -270,7 +328,10 @@ const main = Effect.gen(function* () {
     maxMessageSize: 256 * 1024 * 1024,
   });
   const result = yield* benchmark.pipe(Effect.provide(dataLayer([]).pipe(Layer.provideMerge(database))));
-  const output = new URL(`./results-${mode}${bigCount === 1_000_000 && writesPerWorker === 250 ? "" : "-smoke"}.json`, import.meta.url);
+  const output = new URL(
+    `./results-${mode === "pass5" ? `${mode}-${step}` : mode}-current${bigCount === 1_000_000 && writesPerWorker === 250 ? "" : "-smoke"}.json`,
+    import.meta.url,
+  );
   yield* Effect.tryPromise(() => writeFile(output, JSON.stringify(result, null, 2) + "\n"));
   console.log(JSON.stringify(result, null, 2));
 });

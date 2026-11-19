@@ -97,7 +97,8 @@ export function engine(kinds: readonly RegisteredKind[]) {
     if (!s) return [issue("shape", "Unknown shape")];
     return decodeIssues(compile(r).schemas.get(shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue));
   }
-  function plan(current: Registry, desired: Registry, live: Entity[], version = 0) {
+  function plan(current: Registry, desired: Registry, live: Entity[], version = 0, phase?: (name: string) => void) {
+    phase?.("registry checks and diff");
     current = normalize(current);
     desired = normalize(desired);
     const issues = check(desired),
@@ -111,6 +112,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
         else if (canonical(old.get(key)) !== canonical(next.get(key))) changes.push({ kind: k.name, key, change: "modified" });
       }
     }
+    phase?.("entity revalidation");
     const violations: (Issue & { entity_id: string })[] = [],
       seen = new Set<string>();
     const compiled = issues.length ? undefined : compile(desired);
@@ -144,6 +146,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
         violations.push(...errors.map((x) => ({ entity_id: e.id, ...x })));
       }
     violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field));
+    phase?.("apply overhead");
     return {
       from_version: version,
       to_version: version + 1,

@@ -692,6 +692,13 @@ Rerun the bench after each step and record a row per step per scenario.
 1. **Skip no-op work.** An entity whose retained facts, unique slots and
    edges do not change under the desired registry writes nothing: no
    `live_unique` churn, no edge work, no event. Fix the double `unique()`.
+   Also drop the per-value advisory locks inside registry apply: the
+   exclusive account lock already excludes every writer, and holding one lock
+   per distinct value until commit exhausts PostgreSQL's shared lock memory
+   (make-unique failed at 30,000 entities in phase A). Phase A records that
+   failure as the make-unique baseline; do not raise PostgreSQL's lock limits
+   to work around it. Add a regression test that makes an attribute unique
+   across more entities than the default lock table holds and commits.
 2. **Classify changes before revalidating.** Compute from the registry diff
    which entities can possibly violate the desired registry. Changes that
    cannot (adding an attribute, adding an optional attribute to a shape,
