@@ -118,8 +118,8 @@ Issues are ordered by kind order, then index, then the kind's field order.
   issues, changes, violations }`. `changes` are `{ kind, key, change }` with
   `added | removed | modified` (canonical JSON differs), sorted by kind order
   then key by code point.
-- `violations` revalidate **every live entity** under the desired registry
-  after dropping facts for attributes no longer in its shape: missing required,
+- `violations` describe the impact of the desired registry on all live
+  entities after dropping facts for attributes no longer in the shape: missing required,
   value no longer decodes, duplicate of a now-unique value (reported on every
   entity but the lowest id), `shape` removed, and ref values that no longer
   name a live entity of the target shape ("Dangling reference"). Sorted by
@@ -128,8 +128,9 @@ Issues are ordered by kind order, then index, then the kind's field order.
   violations → 409 with details `<entity_id>.<field>`; otherwise 200. Apply
   retracts facts for attributes removed from a live entity's shape, with
   reason `migration`.
-- Apply holds the account's exclusive lock for its whole duration and
-  revalidates every live entity (see section 9).
+- Apply holds the account's exclusive lock for its whole duration. Plan and
+  apply select entities and facts affected by the registry changes for
+  revalidation (see section 9).
 
 ## 3. Rules
 
@@ -276,10 +277,10 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
   index, not check-then-insert.
 - Registry apply takes no per-value advisory locks. Its exclusive account
   lock guards changes to the live uniqueness projection.
-- Known limits, measured in REPORT.md Pass 5 step B1 at 1M live entities:
-  attaching an optional member held the exclusive account lock for 21.49 s,
-  enabling uniqueness for 273.19 s and retracting a populated member for
-  150.21 s. The lock blocks all writes to that account. `as_of` replays an
+- Known limits, measured in REPORT.md Pass 5 step B2 at 1M live entities:
+  attaching an optional member held the exclusive account lock for 6.91 ms,
+  enabling uniqueness for 253.08 s and retracting a populated member for
+  336.54 s. The lock blocks all writes to that account. `as_of` replays an
   entity's full history.
 
 ## 10. Composition

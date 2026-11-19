@@ -20,6 +20,7 @@ import {
   decodeIssues,
 } from "../core/model.ts";
 import { merge, retain } from "../core/engine.ts";
+import { registryImpact, type RegistryImpact } from "../core/registryImpact.ts";
 import { ensure, ensureApplicable, NotFound, Conflict } from "../Errors.ts";
 // JSON text inside jsonb preserves NUL and lone surrogates.
 export const encodeValue = (v: unknown) => JSON.stringify(canonical(v));
@@ -89,6 +90,22 @@ export const makeStore = (hashOverride?: string) =>
       sql<{ document: string }>`SELECT document FROM entities WHERE account_id=${account} AND NOT deleted`.pipe(
         Effect.map((rows) => rows.map((r) => JSON.parse(r.document) as Entity)),
       );
+    const affected = (account: string, impact: RegistryImpact) =>
+      Effect.gen(function* () {
+        const entities: Entity[] = [],
+          targets = new Map<string, string>();
+        if (!impact.shapes.size) return { entities, targets };
+        const shapes = [...new Set([...impact.shapes.keys(), ...impact.targets])];
+        const rows = yield* sql<{ id: string; shape: string; document: string | null }>`
+          SELECT c.entity_id AS id,c.shape,CASE WHEN c.shape IN ${sql.in([...impact.shapes.keys()])} THEN e.document END AS document
+          FROM events c JOIN entities e ON e.account_id=c.account_id AND e.id=c.entity_id
+          WHERE c.account_id=${account} AND c.kind='create' AND c.shape IN ${sql.in(shapes)} AND NOT e.deleted`;
+        for (const row of rows) {
+          if (row.document !== null) entities.push(JSON.parse(row.document) as Entity);
+          if (impact.targets.has(row.shape)) targets.set(row.id, row.shape);
+        }
+        return { entities, targets };
+      });
     const getLive = (account: string, id: string, mode?: "write" | "delete" | "reference") =>
       Effect.gen(function* () {
         const locking =
@@ -296,9 +313,10 @@ export const makeStore = (hashOverride?: string) =>
           probe?.phase("registry read");
           const current = yield* getRegistry(account);
           if (base !== current.version) return yield* Effect.fail(new Conflict({ issues: [] }));
+          const impact = registryImpact(current.registry, desired);
           probe?.phase("load and parse");
-          const entities = yield* live(account),
-            result = app.plan(current.registry, desired, entities, current.version, probe?.phase);
+          const { entities, targets } = yield* affected(account, impact);
+          const result = app.plan(current.registry, desired, entities, current.version, probe?.phase, { impact, targets });
           yield* ensure(result.issues);
           yield* ensureApplicable(result.violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
           probe?.phase("staging, uniqueness and edges");
@@ -435,7 +453,9 @@ export const makeStore = (hashOverride?: string) =>
         Effect.gen(function* () {
           yield* lock(account);
           const current = yield* getRegistry(account);
-          return app.plan(current.registry, desired, yield* live(account), current.version);
+          const impact = registryImpact(current.registry, desired);
+          const { entities, targets } = yield* affected(account, impact);
+          return app.plan(current.registry, desired, entities, current.version, undefined, { impact, targets });
         }),
       );
     const outbox = (account: string, after: number, limit: number) =>

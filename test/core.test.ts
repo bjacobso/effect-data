@@ -4,6 +4,7 @@ import { Schema, Arbitrary, Effect } from "effect";
 import { readdirSync, readFileSync } from "node:fs";
 import { compose } from "../src/composition.ts";
 import { engine } from "../src/core/engine.ts";
+import { registryImpact } from "../src/core/registryImpact.ts";
 import { collect } from "../src/core/registry.ts";
 import { defineKind, defineOp } from "../src/core/model.ts";
 import { policyKind, ops } from "../src/packs/onboarding/documents.ts";
@@ -24,6 +25,89 @@ const entity = (facts: Entity["facts"]): Entity => ({
 });
 
 describe("registry pipeline", () => {
+  test("classified plans agree with full revalidation across registry pairs and valid live projections", () => {
+    const id = (n: number) => `en_${String(n).padStart(21, "0")}`;
+    fc.assert(
+      fc.property(
+        fc.record({
+          startedUnique: fc.boolean(),
+          makeUnique: fc.boolean(),
+          required: fc.boolean(),
+          keepMember: fc.boolean(),
+          removeTarget: fc.boolean(),
+          refType: fc.constantFrom("leave", "retarget", "string", "clear"),
+          valueType: fc.constantFrom("string", "integer", "enum"),
+          enumValues: fc.subarray(["a", "b", "\u0000", "\ud800"], { minLength: 1 }),
+          addPolicy: fc.boolean(),
+          rows: fc.array(fc.record({ value: fc.option(fc.constantFrom("a", "b", "\u0000", "\ud800")), linked: fc.boolean() })),
+        }),
+        (sample) => {
+          const current: Registry = {
+            attributes: [
+              { key: "data/value", type: "string", unique: sample.startedUnique },
+              { key: "data/link", type: "ref", target: "target" },
+              { key: "data/name", type: "string" },
+            ],
+            shapes: [
+              { key: "source", attributes: ["data/value", "data/link"] },
+              { key: "target", attributes: ["data/name"] },
+              { key: "other", attributes: ["data/name", "data/value"] },
+            ],
+            automations: [],
+          };
+          const live = [
+            { ...entity({}), shape: "target", id: id(0) },
+            ...sample.rows.map(({ value, linked }, i) => ({
+              ...entity({
+                ...(value === null ? {} : { "data/value": sample.startedUnique ? value + i : value }),
+                ...(linked && i % 2 === 0 ? { "data/link": id(0) } : {}),
+              }),
+              shape: i % 2 === 0 ? "source" : "other",
+              id: id(i + 1),
+            })),
+          ].reverse();
+          const link = current.attributes[1]!;
+          const desired: Registry = {
+            ...current,
+            attributes: [
+              {
+                key: "data/value",
+                type: sample.valueType,
+                unique: sample.makeUnique,
+                ...(sample.valueType === "enum" ? { values: sample.enumValues } : {}),
+                label: "Value",
+              },
+              sample.refType === "string"
+                ? { key: link.key, type: "string" }
+                : sample.refType === "retarget"
+                  ? { ...link, target: "other" }
+                  : sample.refType === "clear"
+                    ? { ...link, on_delete: "clear" }
+                    : link,
+              current.attributes[2]!,
+              { key: "data/extra", type: "boolean" },
+            ],
+            shapes: [
+              {
+                key: "source",
+                attributes: ["data/link", "data/extra", ...(sample.keepMember ? ["data/value"] : [])],
+                required: sample.required && sample.keepMember ? ["data/value"] : [],
+              },
+              ...current.shapes.slice(sample.removeTarget ? 2 : 1),
+            ],
+            policies: sample.addPolicy ? [{ id: "extra", shape: "source", applies_when: true, requires: [{ form: "test" }] }] : [],
+          };
+          expect(app.plan(current, current, live).violations).toEqual([]);
+          const impact = registryImpact(current, desired);
+          const candidates = live.filter((e) => impact.shapes.has(e.shape));
+          const targets = new Map(live.filter((e) => impact.targets.has(e.shape)).map((e) => [e.id, e.shape]));
+          expect(app.plan(current, desired, candidates, 1, undefined, { impact, targets })).toEqual(app.plan(current, desired, live, 1));
+        },
+      ),
+      { numRuns: 400 },
+    );
+  });
+
   test("fixture checks, compiles real schemas, plans canonical differences", () => {
     const r = fixture(),
       c = app.compile(r);

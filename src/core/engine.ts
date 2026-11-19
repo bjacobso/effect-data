@@ -19,6 +19,15 @@ import { attributeEdges } from "./kinds.ts";
 import { evaluator } from "./rules.ts";
 import { valueSchema } from "./values.ts";
 import { KindRegistry, type RegisteredKind } from "./registry.ts";
+import type { RegistryImpact } from "./registryImpact.ts";
+
+const entitySchema = (attributes: ReadonlyMap<string, Schema.Codec<unknown>>, shape: Shape, keys: Iterable<string>) =>
+  Schema.Struct(
+    Object.fromEntries(
+      [...keys].map((key) => [key, shape.required?.includes(key) ? attributes.get(key)! : Schema.optionalKey(attributes.get(key)!)]),
+    ),
+  ) as Schema.Codec<Facts>;
+
 export function engine(kinds: readonly RegisteredKind[]) {
   const empty = (): Registry => Object.fromEntries(kinds.map((k) => [k.collection, []])) as unknown as Registry;
   const fields: Record<string, Schema.Codec<unknown>> = Object.fromEntries(kinds.map((k) => [k.collection, list(k.schema)]));
@@ -72,19 +81,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
   }
   function compile(r: Registry) {
     const attributes = new Map((r.attributes ?? []).map((a) => [a.key, valueSchema(a)]));
-    const schemas = new Map(
-      (r.shapes ?? []).map((s) => [
-        s.key,
-        Schema.Struct(
-          Object.fromEntries(
-            s.attributes.map((key: string) => [
-              key,
-              s.required?.includes(key) ? attributes.get(key)! : Schema.optionalKey(attributes.get(key)!),
-            ]),
-          ),
-        ) as Schema.Codec<Facts>,
-      ]),
-    );
+    const schemas = new Map((r.shapes ?? []).map((s) => [s.key, entitySchema(attributes, s, s.attributes)]));
     const rules = new Map<string, ReturnType<typeof evaluator>>();
     for (const kind of kinds)
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
@@ -97,7 +94,14 @@ export function engine(kinds: readonly RegisteredKind[]) {
     if (!s) return [issue("shape", "Unknown shape")];
     return decodeIssues(compile(r).schemas.get(shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue));
   }
-  function plan(current: Registry, desired: Registry, live: Entity[], version = 0, phase?: (name: string) => void) {
+  function plan(
+    current: Registry,
+    desired: Registry,
+    live: Entity[],
+    version = 0,
+    phase?: (name: string) => void,
+    scope?: { impact: RegistryImpact; targets: ReadonlyMap<string, string> },
+  ) {
     phase?.("registry checks and diff");
     current = normalize(current);
     desired = normalize(desired);
@@ -115,29 +119,41 @@ export function engine(kinds: readonly RegisteredKind[]) {
     phase?.("entity revalidation");
     const violations: (Issue & { entity_id: string })[] = [],
       seen = new Set<string>();
-    const compiled = issues.length ? undefined : compile(desired);
-    const edges = compiled?.edges ?? attributeEdges(desired.attributes);
-    const targets = new Map<string, string>();
+    const valid = !issues.length;
+    const edges = attributeEdges(desired.attributes);
     const shapes = new Map(desired.shapes.map((s) => [s.key, s]));
-    if (edges.size) for (const e of live) if (shapes.has(e.shape)) targets.set(e.id, e.shape);
-    if (compiled || edges.size)
-      for (const e of [...live].sort((a, b) => compare(a.id, b.id))) {
+    const targets = scope?.targets ?? new Map(edges.size ? live.filter((e) => shapes.has(e.shape)).map((e) => [e.id, e.shape]) : []);
+    const schemas = new Map<string, Schema.Codec<Facts>>();
+    if (valid && (!scope || scope.impact.shapes.size)) {
+      const attributes = new Map(desired.attributes.map((a) => [a.key, valueSchema(a)]));
+      for (const s of desired.shapes) {
+        const keys = scope ? scope.impact.shapes.get(s.key)?.fields : s.attributes;
+        if (keys && (!scope || scope.impact.shapes.get(s.key)!.fields.size)) schemas.set(s.key, entitySchema(attributes, s, keys));
+      }
+    }
+    if (valid || edges.size) {
+      const hasUnique = scope ? [...scope.impact.shapes.values()].some((s) => s.unique.size > 0) : desired.attributes.some((a) => a.unique);
+      for (const e of hasUnique ? [...live].sort((a, b) => compare(a.id, b.id)) : live) {
+        const impact = scope?.impact.shapes.get(e.shape);
+        if (scope && !impact) continue;
         const s = shapes.get(e.shape),
           facts = s ? retain(e.facts, s) : {};
-        const errors = !compiled
-          ? []
-          : s
-            ? decodeIssues(compiled.schemas.get(e.shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue))
-            : [issue("shape", "Unknown shape")];
+        const schema = schemas.get(e.shape);
+        const fields = impact ? Object.fromEntries(Object.entries(facts).filter(([key]) => impact.fields.has(key))) : facts;
+        const errors = schema
+          ? decodeIssues(schema, fields).map((x) => issue(`facts.${x.field}`, x.issue))
+          : valid && !s
+            ? [issue("shape", "Unknown shape")]
+            : [];
         for (const [k, v] of Object.entries(facts)) {
-          const edge = edges.get(k);
+          const edge = !impact || impact.refs.has(k) ? edges.get(k) : undefined;
           if (edge && (typeof v !== "string" || targets.get(v) !== edge.target)) {
             const field = `facts.${k}`;
             const existing = errors.findIndex((x) => x.field === field);
             if (existing >= 0) errors.splice(existing, 1);
             errors.push(issue(field, "Dangling reference"));
           }
-          if (compiled && findAttribute(desired, k)?.unique) {
+          if (valid && (impact ? impact.unique.has(k) : findAttribute(desired, k)?.unique)) {
             const identity = canonical([k, v]);
             if (seen.has(identity)) errors.push(issue(`facts.${k}`, "Duplicate unique value"));
             else seen.add(identity);
@@ -145,6 +161,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
         }
         violations.push(...errors.map((x) => ({ entity_id: e.id, ...x })));
       }
+    }
     violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field));
     phase?.("apply overhead");
     return {

@@ -882,6 +882,9 @@ The timings are individual local runs. The investigation used `--cpu-prof`.
 | B1 | Attach optional | 21.494 | 21.493 | 21,516.32 / 21,527.29 |
 | B1 | Make unique | 273.190 | 273.189 | 273,228.11 / 273,236.29 |
 | B1 | Remove populated | 150.206 | 150.206 | 151,912.29 / 151,986.39 |
+| B2 | Attach optional | 0.008 | 0.007 | 18.45 / 23.05 |
+| B2 | Make unique | 253.079 | 253.079 | 253,128.44 / 253,140.27 |
+| B2 | Remove populated | 336.538 | 336.537 | 336,887.73 / 336,899.49 |
 
 B1 leaves the uniqueness slots of unchanged entities untouched. Registry
 apply already excludes writers to its account, so newly unique values can
@@ -891,3 +894,14 @@ duplicate writes fail. Attach's staging went from one million statements to
 zero. Make-unique committed with four statements per added slot. For removal
 the linear projection assembly eliminated the repeated step lookup, then
 flush took 125.27 s across 338 bulk inserts. [B1 measurements](bench/results-pass5-b1.json)
+
+B2 classifies changed constraints in core and uses an index on creation
+events to select live entities of the affected shapes. Ref checks can read
+target ids and their shapes without loading the target documents. The
+400-case differential property compares classified output with full
+revalidation of valid live projections, including invalid desired
+registries, duplicate values and ref changes. Attach needed no live-entity
+statement or decode and held the lock for 6.91 ms. Make-unique still spent
+240.10 s in slot writes. Removal revalidation fell from 19.28 s to 1.15 s.
+Its same 338 bulk inserts plus assembly took 328.16 s in this run, compared
+with 125.27 s in B1. [B2 measurements](bench/results-pass5-b2.json)
