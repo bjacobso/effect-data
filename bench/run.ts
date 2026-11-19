@@ -207,10 +207,7 @@ const benchmark = Effect.gen(function* () {
   let version = 1;
   for (const [i, [name, desired]] of scenarios.entries()) {
     console.log(`Measuring registry apply: ${name}`);
-    let held!: () => void;
-    const granted = new Promise<void>((resolve) => {
-      held = resolve;
-    });
+    const granted = Promise.withResolvers<boolean>();
     let lockStart = 0;
     let rssAfterLoad = 0;
     const [operation, concurrent] = yield* Effect.all(
@@ -218,17 +215,20 @@ const benchmark = Effect.gen(function* () {
         measureExit(store.apply(big, "bench", desired, version), (phase, now) => {
           if (phase === "registry read") {
             lockStart = now;
-            held();
+            granted.resolve(true);
           }
-          if (phase === "registry checks and diff") rssAfterLoad = process.memoryUsage.rss();
-        }),
-        Effect.promise(() => granted).pipe(
-          Effect.andThen(
-            Effect.forEach(
-              Array.from({ length: workers }, (_, j) => j),
-              (j) => measure(store.mutate(big, "bench", { facts: { "bench/flag": i % 2 === 0 } }, entityId(4 + j))),
-              { concurrency: workers },
-            ),
+          if (phase === "registry checks and diff" || phase === "preflight validation and staging")
+            rssAfterLoad = Math.max(rssAfterLoad, process.memoryUsage.rss());
+        }).pipe(Effect.tap(() => Effect.sync(() => granted.resolve(false)))),
+        Effect.promise(() => granted.promise).pipe(
+          Effect.flatMap((locked) =>
+            locked
+              ? Effect.forEach(
+                  Array.from({ length: workers }, (_, j) => j),
+                  (j) => measure(store.mutate(big, "bench", { facts: { "bench/flag": i % 2 === 0 } }, entityId(4 + j))),
+                  { concurrency: workers },
+                )
+              : Effect.succeed([]),
           ),
         ),
       ],

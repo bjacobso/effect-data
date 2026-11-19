@@ -19,8 +19,9 @@ import {
   issue,
   decodeIssues,
 } from "../core/model.ts";
-import { merge, retain } from "../core/engine.ts";
+import { merge } from "../core/engine.ts";
 import { registryImpact, type RegistryImpact } from "../core/registryImpact.ts";
+import { registryReview } from "../core/registryReview.ts";
 import { ensure, ensureApplicable, NotFound, Conflict } from "../Errors.ts";
 // JSON text inside jsonb preserves NUL and lone surrogates.
 export const encodeValue = (v: unknown) => JSON.stringify(canonical(v));
@@ -37,6 +38,8 @@ export type Fact = {
 type Event = { tx: number; at: string; kind: string; shape: string; version: number; registry_version: number; created_at: string };
 type Step = { entity: Entity; keys: string[]; before: Facts; actor: string; reason: string; kind: string };
 type Delivery = { index: number; entity_id: string; automation_id: string; action: Doc };
+type Candidate = { id: string; shape: string; document: string | null; deleted?: boolean };
+type UniqueSlot = { entity_id: string; attribute: string; encoded: string };
 export type Mutation = { shape?: string; facts: Record<string, unknown>; expected_version?: number };
 export const StoreProbe = Context.Reference<{ phase: (name: string) => void; rows?: (count: number) => void } | undefined>(
   "data/StoreProbe",
@@ -96,7 +99,7 @@ export const makeStore = (hashOverride?: string) =>
           targets = new Map<string, string>();
         if (!impact.shapes.size) return { entities, targets };
         const shapes = [...new Set([...impact.shapes.keys(), ...impact.targets])];
-        const rows = yield* sql<{ id: string; shape: string; document: string | null }>`
+        const rows = yield* sql<Candidate>`
           SELECT c.entity_id AS id,c.shape,CASE WHEN c.shape IN ${sql.in([...impact.shapes.keys()])} THEN e.document END AS document
           FROM events c JOIN entities e ON e.account_id=c.account_id AND e.id=c.entity_id
           WHERE c.account_id=${account} AND c.kind='create' AND c.shape IN ${sql.in(shapes)} AND NOT e.deleted`;
@@ -106,6 +109,19 @@ export const makeStore = (hashOverride?: string) =>
         }
         return { entities, targets };
       });
+    const candidatePage = (account: string, shape: string, document: boolean, after: string) => sql<Candidate>`
+      SELECT c.entity_id AS id,c.shape,${document ? sql`e.document` : sql`NULL::text`} AS document
+      FROM events c JOIN entities e ON e.account_id=c.account_id AND e.id=c.entity_id
+      WHERE c.account_id=${account} AND c.kind='create' AND c.shape=${shape} AND NOT e.deleted
+        AND c.entity_id COLLATE "C">${after}
+      ORDER BY c.entity_id COLLATE "C" LIMIT 5000`;
+    const changedSince = (account: string, position: string, impact: RegistryImpact) => sql<Candidate>`
+      SELECT d.entity_id AS id,d.shape,e.deleted,CASE WHEN NOT e.deleted AND d.shape IN ${sql.in([...impact.shapes.keys()])}
+        THEN e.document END AS document
+      FROM (SELECT DISTINCT entity_id,shape FROM events
+        WHERE account_id=${account} AND tx>${position}::bigint
+          AND shape IN ${sql.in([...new Set([...impact.shapes.keys(), ...impact.targets])])}) d
+      JOIN entities e ON e.account_id=${account} AND e.id=d.entity_id`;
     const getLive = (account: string, id: string, mode?: "write" | "delete" | "reference") =>
       Effect.gen(function* () {
         const locking =
@@ -121,12 +137,12 @@ export const makeStore = (hashOverride?: string) =>
         if (!rows[0]) return yield* Effect.fail(new NotFound());
         return JSON.parse(rows[0].document) as Entity;
       });
-    const insertUnique = (account: string, id: string, key: string, value: Value, exclusive: boolean) =>
+    const insertUnique = (account: string, id: string, key: string, value: Value) =>
       Effect.gen(function* () {
         const encoded = encodeValue(value);
         const hashes = yield* sql<{ hash: string }>`SELECT coalesce(${hashOverride ?? null},md5(${encoded}::jsonb::text)) AS hash`;
         const hash = hashes[0]!.hash;
-        if (!exclusive) yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${canonical([account, key, hash])},1))`;
+        yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${canonical([account, key, hash])},1))`;
         const existing = yield* sql<{
           id: string;
         }>`SELECT id::text FROM unique_values WHERE account_id=${account} AND attribute=${key} AND hash=${hash} AND value=${encoded}::jsonb`;
@@ -142,6 +158,24 @@ export const makeStore = (hashOverride?: string) =>
           ),
         );
       });
+    // Plan validation and the exclusive account lock precede this insert.
+    // Resolve existing values by both hash and encoded value, as PATCH does.
+    const insertUniqueBatch = (account: string, slots: UniqueSlot[]) => sql`
+      WITH input AS MATERIALIZED (
+        SELECT entity_id,attribute,encoded::jsonb AS value,coalesce(${hashOverride ?? null},md5(encoded::jsonb::text)) AS hash
+        FROM jsonb_to_recordset(${JSON.stringify(slots)}::jsonb) AS t(entity_id text,attribute text,encoded text)
+      ), resolved AS MATERIALIZED (
+        SELECT i.*,(SELECT u.id FROM unique_values u
+          WHERE u.account_id=${account} AND u.attribute=i.attribute AND u.hash=i.hash AND u.value=i.value LIMIT 1) AS id
+        FROM input i
+      ), inserted AS (
+        INSERT INTO unique_values(account_id,attribute,hash,value)
+        SELECT ${account},attribute,hash,value FROM resolved WHERE id IS NULL
+        RETURNING id,attribute,hash,value
+      )
+      INSERT INTO live_unique(account_id,entity_id,attribute,value,value_id)
+      SELECT ${account},r.entity_id,r.attribute,r.value,coalesce(r.id,i.id)
+      FROM resolved r LEFT JOIN inserted i USING(attribute,hash,value)`;
     const stage = (
       steps: Step[],
       account: string,
@@ -159,14 +193,12 @@ export const makeStore = (hashOverride?: string) =>
           .sort(compare);
         if (before && !keys.length && kind !== "delete") return before;
         const next = { ...entity, version: (before?.version ?? 0) + 1, created_at: before?.created_at ?? "" };
-        const probe = reason === "migration" ? undefined : yield* StoreProbe;
+        const probe = yield* StoreProbe;
         probe?.phase("uniqueness");
-        if (reason !== "migration") {
-          yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
-          if (kind !== "delete")
-            for (const [key, value] of Object.entries(next.facts).sort(([a], [b]) => compare(a, b)))
-              if (findAttribute(registry, key)?.unique) yield* insertUnique(account, next.id, key, value, false);
-        }
+        yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
+        if (kind !== "delete")
+          for (const [key, value] of Object.entries(next.facts).sort(([a], [b]) => compare(a, b)))
+            if (findAttribute(registry, key)?.unique) yield* insertUnique(account, next.id, key, value);
         probe?.phase("edge update");
         if (edges.size) yield* refs.update(account, next, keys, edges);
         probe?.phase("staging and automations");
@@ -304,68 +336,158 @@ export const makeStore = (hashOverride?: string) =>
         }),
       );
     const apply = (account: string, actor: string, desired: Registry, base: number) =>
-      sql.withTransaction(
-        Effect.gen(function* () {
-          const probe = yield* StoreProbe;
-          desired = app.normalize(desired);
-          probe?.phase("account lock");
-          yield* lock(account, true);
-          probe?.phase("registry read");
-          const current = yield* getRegistry(account);
-          if (base !== current.version) return yield* Effect.fail(new Conflict({ issues: [] }));
-          const impact = registryImpact(current.registry, desired);
-          probe?.phase("load and parse");
-          const { entities, targets } = yield* affected(account, impact);
-          const result = app.plan(current.registry, desired, entities, current.version, probe?.phase, { impact, targets });
-          yield* ensure(result.issues);
-          yield* ensureApplicable(result.violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
-          probe?.phase("staging, uniqueness and edges");
-          const steps: Step[] = [];
-          const previous = compiled(account, current.version, current.registry).edges;
-          // The desired version is not committed yet, so keep it out of the cache.
-          const edges = app.compile(desired).edges;
-          const previousUnique = new Set(current.registry.attributes.filter((a) => a.unique).map((a) => a.key));
-          const desiredUnique = new Set(desired.attributes.filter((a) => a.unique).map((a) => a.key));
-          const addedUnique = [...desiredUnique].filter((key) => !previousUnique.has(key)).sort(compare);
-          const removedUnique = [...previousUnique].filter((key) => !desiredUnique.has(key));
-          if (removedUnique.length)
-            yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND attribute IN ${sql.in(removedUnique)}`;
-          const members = new Map(desired.shapes.map((s) => [s.key, new Set(s.attributes)]));
-          for (const e of entities) {
-            const keys = Object.keys(e.facts).filter((key) => !members.get(e.shape)!.has(key));
-            let after = e;
-            if (keys.length) {
-              const released = keys.filter((key) => previousUnique.has(key) && desiredUnique.has(key));
-              if (released.length)
-                yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${e.id} AND attribute IN ${sql.in(released)}`;
-              const facts = { ...e.facts };
-              for (const key of keys) delete facts[key];
-              after = yield* stage(
-                steps,
-                account,
-                e,
-                { ...e, facts, registry_version: current.version + 1 },
-                desired,
+      Effect.gen(function* () {
+        const probe = yield* StoreProbe;
+        desired = app.normalize(desired);
+        const version = base + 1;
+        const snapshot = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              probe?.phase("preflight registry read");
+              const current = yield* getRegistry(account);
+              if (base !== current.version) return yield* Effect.fail(new Conflict({ issues: [] }));
+              const impact = registryImpact(current.registry, desired);
+              const plan = app.preparePlan(current.registry, desired, base, probe?.phase, impact);
+              const review = registryReview(plan.inspect);
+              const previous = compiled(account, base, current.registry).edges;
+              // The desired version is not committed yet, so keep it out of the cache.
+              const edges = plan.issues.length ? previous : app.compile(desired).edges;
+              const previousUnique = new Set(current.registry.attributes.filter((a) => a.unique).map((a) => a.key));
+              const desiredUnique = new Set(desired.attributes.filter((a) => a.unique).map((a) => a.key));
+              const addedUnique = [...desiredUnique].filter((key) => !previousUnique.has(key)).sort(compare);
+              const removedUnique = [...previousUnique].filter((key) => !desiredUnique.has(key));
+              const addedEdges = [...edges.keys()].filter((key) => !previous.has(key));
+              const members = new Map(desired.shapes.map((s) => [s.key, new Set(s.attributes)]));
+              const steps = new Map<string, Step>();
+              const edgeSources = new Map<string, Entity>();
+              const uniqueSlots = new Map<string, UniqueSlot[]>();
+
+              const accept = (row: Candidate) => {
+                if (impact.targets.has(row.shape)) review.setTarget(row.id, row.deleted ? undefined : row.shape);
+                if (!impact.shapes.has(row.shape)) return;
+                const e = row.document === null ? undefined : (JSON.parse(row.document) as Entity);
+                review.setEntity(row.id, e);
+                steps.delete(row.id);
+                edgeSources.delete(row.id);
+                uniqueSlots.delete(row.id);
+                const accepted = e && members.get(e.shape);
+                if (!e || !accepted) return;
+                const keys = Object.keys(e.facts)
+                  .filter((key) => !accepted.has(key))
+                  .sort(compare);
+                let after = e;
+                if (keys.length) {
+                  const facts = { ...e.facts };
+                  for (const key of keys) delete facts[key];
+                  after = { ...e, facts, version: e.version + 1, registry_version: version };
+                  steps.set(row.id, { entity: after, keys, before: e.facts, actor, reason: "migration", kind: "write" });
+                }
+                if (addedEdges.some((key) => key in after.facts)) edgeSources.set(row.id, after);
+                if (addedUnique.length) {
+                  const slots = addedUnique
+                    .filter((key) => key in after.facts)
+                    .map((key) => ({
+                      entity_id: row.id,
+                      attribute: key,
+                      encoded: encodeValue(after.facts[key]),
+                    }));
+                  if (slots.length) uniqueSlots.set(row.id, slots);
+                }
+              };
+
+              let position: string | undefined;
+              if (!plan.issues.length && impact.shapes.size) {
+                probe?.phase("snapshot position");
+                const [watermark] = yield* sql<{ tx: string }>`SELECT tx::text FROM account_clocks WHERE account_id=${account}`;
+                position = watermark?.tx ?? "0";
+                for (const shape of new Set([...impact.shapes.keys(), ...impact.targets])) {
+                  let after = "";
+                  while (true) {
+                    probe?.phase("preflight load");
+                    const rows = yield* candidatePage(account, shape, impact.shapes.has(shape), after);
+                    if (!rows.length) break;
+                    probe?.phase("preflight validation and staging");
+                    for (const row of rows) accept(row);
+                    after = rows.at(-1)!.id;
+                  }
+                }
+              }
+              probe?.phase("preflight validation and staging");
+              const violations = plan.finish(review.finish()).violations;
+              probe?.phase("snapshot completion");
+              return {
+                impact,
+                plan,
+                position,
+                accept,
+                review,
+                violations,
+                previous,
                 edges,
-                actor,
-                "migration",
-              );
+                desiredUnique,
+                removedUnique,
+                steps,
+                edgeSources,
+                uniqueSlots,
+              };
+            }),
+          )
+          .pipe(Effect.provideService(SqlClient.BeginTransaction, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
+
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            probe?.phase("account lock");
+            yield* lock(account, true);
+            probe?.phase("registry read");
+            if ((yield* getRegistry(account)).version !== base) return yield* Effect.fail(new Conflict({ issues: [] }));
+            yield* ensure(snapshot.plan.issues);
+            probe?.phase("recheck concurrent writes");
+            let violations = snapshot.violations;
+            if (snapshot.position !== undefined) {
+              const touched = yield* changedSince(account, snapshot.position, snapshot.impact);
+              if (touched.length) {
+                for (const row of touched) snapshot.accept(row);
+                violations = snapshot.plan.finish(snapshot.review.finish()).violations;
+              }
             }
-            // The exclusive account lock excludes all writers of these values.
-            for (const key of addedUnique) if (key in after.facts) yield* insertUnique(account, after.id, key, after.facts[key]!, true);
-          }
-          function* retained() {
-            for (const e of entities) yield { ...e, facts: retain(e.facts, findShape(desired, e.shape)!) };
-          }
-          if (previous.size || edges.size) yield* refs.reconcile(account, previous, edges, retained());
-          const version = current.version + 1;
-          probe?.phase("registry write");
-          yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${JSON.stringify(desired)}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
-          yield* flush(account, steps);
-          probe?.phase("transaction completion");
-          return { version, ...desired };
-        }),
-      );
+            yield* ensureApplicable(violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
+
+            probe?.phase("staging, uniqueness and edges");
+            if (snapshot.removedUnique.length)
+              yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND attribute IN ${sql.in(snapshot.removedUnique)}`;
+            const steps = [...snapshot.steps.values()];
+            for (const { entity, keys } of steps) {
+              if (snapshot.desiredUnique.size) {
+                const released = keys.filter((key) => snapshot.desiredUnique.has(key));
+                if (released.length)
+                  yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${entity.id} AND attribute IN ${sql.in(released)}`;
+              }
+              if (keys.some((key) => snapshot.edges.has(key))) yield* refs.update(account, entity, keys, snapshot.edges);
+            }
+            let batch: UniqueSlot[] = [],
+              encodedLength = 0;
+            for (const slots of snapshot.uniqueSlots.values()) {
+              for (const slot of slots) {
+                batch.push(slot);
+                encodedLength += slot.encoded.length;
+                if (batch.length === 5_000 || encodedLength >= 1_000_000) {
+                  yield* insertUniqueBatch(account, batch);
+                  batch = [];
+                  encodedLength = 0;
+                }
+              }
+            }
+            if (batch.length) yield* insertUniqueBatch(account, batch);
+            if (snapshot.previous.size || snapshot.edges.size)
+              yield* refs.reconcile(account, snapshot.previous, snapshot.edges, snapshot.edgeSources.values());
+            probe?.phase("registry write");
+            yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${JSON.stringify(desired)}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
+            yield* flush(account, steps);
+            probe?.phase("transaction completion");
+            return { version, ...desired };
+          }),
+        );
+      });
     const history = (account: string, id: string) =>
       Effect.gen(function* () {
         const exists = yield* sql`SELECT 1 FROM events WHERE account_id=${account} AND entity_id=${id} LIMIT 1`;

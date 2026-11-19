@@ -885,6 +885,9 @@ The timings are individual local runs. The investigation used `--cpu-prof`.
 | B2 | Attach optional | 0.008 | 0.007 | 18.45 / 23.05 |
 | B2 | Make unique | 253.079 | 253.079 | 253,128.44 / 253,140.27 |
 | B2 | Remove populated | 336.538 | 336.537 | 336,887.73 / 336,899.49 |
+| B3 | Attach optional | 0.009 | 0.002 | 14.69 / 18.80 |
+| B3 | Make unique | 47.998 | 37.474 | 37,509.61 / 37,518.59 |
+| B3 | Remove populated | 128.017 | 118.361 | 118,626.59 / 118,639.48 |
 
 B1 leaves the uniqueness slots of unchanged entities untouched. Registry
 apply already excludes writers to its account, so newly unique values can
@@ -905,3 +908,18 @@ statement or decode and held the lock for 6.91 ms. Make-unique still spent
 240.10 s in slot writes. Removal revalidation fell from 19.28 s to 1.15 s.
 Its same 338 bulk inserts plus assembly took 328.16 s in this run, compared
 with 125.27 s in B1. [B2 measurements](bench/results-pass5-b2.json)
+
+B3 pages affected live entities in a repeatable-read snapshot at a recorded
+account tx. It prepares validation results, uniqueness slots and
+retractions before taking the account lock. The write transaction checks
+the registry version again and reads the event tail. Changes to a unique
+value or ref target also update the checks that depend on it. Storage tests
+cover a new duplicate, a repaired duplicate, a concurrently deleted ref
+target and a write to an entity that will be retracted.
+
+The one-million-row snapshot used 201 page reads for each expensive apply.
+Make-unique moved 10.52 s before the lock and reduced uniqueness statements
+from four million to 200. Inserting the million slots and their interned
+values still took 37.46 s under the lock. Removal moved 9.66 s before the
+lock and spent 118.22 s in the atomic flush of events, facts and
+projections. [B3 measurements](bench/results-pass5-b3.json)

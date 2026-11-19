@@ -10,7 +10,7 @@ the behaviour it describes.
   and this file must be brought back into agreement; PLAN.md is not edited
   after its pass lands.
 
-Status: through **Pass 4** (refs between entities). Packs: `onboarding`,
+Status: through **Pass 5** (registry apply performance). Packs: `onboarding`,
 `certification`.
 
 ## 1. Model
@@ -119,7 +119,8 @@ Issues are ordered by kind order, then index, then the kind's field order.
   `added | removed | modified` (canonical JSON differs), sorted by kind order
   then key by code point.
 - `violations` describe the impact of the desired registry on all live
-  entities after dropping facts for attributes no longer in the shape: missing required,
+  entities after dropping facts for attributes no longer in the shape:
+  missing required,
   value no longer decodes, duplicate of a now-unique value (reported on every
   entity but the lowest id), `shape` removed, and ref values that no longer
   name a live entity of the target shape ("Dangling reference"). Sorted by
@@ -128,9 +129,11 @@ Issues are ordered by kind order, then index, then the kind's field order.
   violations → 409 with details `<entity_id>.<field>`; otherwise 200. Apply
   retracts facts for attributes removed from a live entity's shape, with
   reason `migration`.
-- Apply holds the account's exclusive lock for its whole duration. Plan and
-  apply select entities and facts affected by the registry changes for
-  revalidation (see section 9).
+- Plan and apply select entities and facts affected by registry changes for
+  revalidation. Apply prepares these checks from a committed snapshot before
+  taking the account's exclusive lock. Under the lock it checks the registry
+  version again, updates its checks for entity writes since the snapshot,
+  and commits the registry and migration together (see section 9).
 
 ## 3. Rules
 
@@ -277,11 +280,11 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
   index, not check-then-insert.
 - Registry apply takes no per-value advisory locks. Its exclusive account
   lock guards changes to the live uniqueness projection.
-- Known limits, measured in REPORT.md Pass 5 step B2 at 1M live entities:
-  attaching an optional member held the exclusive account lock for 6.91 ms,
-  enabling uniqueness for 253.08 s and retracting a populated member for
-  336.54 s. The lock blocks all writes to that account. `as_of` replays an
-  entity's full history.
+- Known limits, measured in REPORT.md Pass 5 at 1M live entities: attaching
+  an optional member held the exclusive account lock for 2.21 ms, enabling
+  uniqueness for 37.47 s and retracting a populated member for 118.36 s. The
+  lock blocks all writes to that account. `as_of` replays an entity's full
+  history.
 
 ## 10. Composition
 

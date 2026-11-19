@@ -2,6 +2,7 @@ import { beforeAll, afterAll, test, expect } from "vitest";
 import fc from "fast-check";
 import { Effect, ManagedRuntime, Arbitrary, Schema, Redacted, Layer } from "effect";
 import { PgClient } from "@effect/sql-pg";
+import { Statement } from "effect/sql";
 import { randomBytes } from "node:crypto";
 import { DataLive } from "../src/composition.ts";
 import { Engine, type EngineValue } from "../src/core/engine.ts";
@@ -430,6 +431,102 @@ test("apply enables uniqueness beyond the shared advisory lock table without wri
   expect(duplicate).toMatchObject({ _tag: "Conflict", issues: [{ field: `facts.${attribute}`, issue: "Duplicate unique value" }] });
 }, 30000);
 
+async function duringPreflight<A>(apply: Effect.Effect<A, unknown>, write: () => Promise<unknown>) {
+  const scanned = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  let paused = false;
+  const applied = run(
+    apply.pipe(
+      Effect.provideService(Statement.CurrentTransformer, (statement) => {
+        if (paused || !statement.compile()[0].includes('ORDER BY c.entity_id COLLATE "C"')) return Effect.succeed(statement);
+        paused = true;
+        scanned.resolve();
+        return Effect.promise(() => resume.promise).pipe(Effect.as(statement));
+      }),
+      Effect.exit,
+    ),
+  );
+  try {
+    await Promise.race([
+      scanned.promise,
+      applied.then(() => {
+        throw new Error("Apply exited before its scan");
+      }),
+    ]);
+    await write();
+  } finally {
+    resume.resolve();
+  }
+  return run(
+    Effect.flatMap(
+      Effect.promise(() => applied),
+      (exit) => exit,
+    ),
+  );
+}
+
+test("apply rechecks uniqueness groups when a writer changes a scanned value", async () => {
+  const a = account(),
+    attribute = "test/value";
+  const initial = {
+    attributes: [{ key: attribute, type: "integer" }],
+    shapes: [{ key: "item", attributes: [attribute] }],
+    automations: [],
+  };
+  const desired = { ...initial, attributes: [{ key: attribute, type: "integer", unique: true }] };
+  const patch = (id: string, value: number) => run(store.mutate(a, "writer", { facts: { [attribute]: value } }, id));
+  await run(store.apply(a, "test", initial, 0));
+  const first = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: 1 } }));
+  const second = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: 2 } }));
+  const loser = [first.id, second.id].sort()[1];
+  await expect(duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1)), () => patch(first.id, 2))).resolves.toMatchObject({
+    _tag: "Conflict",
+    issues: [{ field: `${loser}.facts.${attribute}`, issue: "Duplicate unique value" }],
+  });
+  const lower = [first.id, second.id].sort()[0]!;
+  await expect(duringPreflight(store.apply(a, "admin", desired, 1), () => patch(lower, 3))).resolves.toMatchObject({ version: 2 });
+});
+
+test("apply detects a deleted target referenced by an unchanged source during preflight", async () => {
+  const a = account(),
+    attribute = "test/target";
+  const initial = {
+    attributes: [{ key: attribute, type: "string" }],
+    shapes: [{ key: "item", attributes: [attribute] }],
+    automations: [],
+  };
+  const desired = { ...initial, attributes: [{ key: attribute, type: "ref", target: "item" }] };
+  await run(store.apply(a, "test", initial, 0));
+  const target = await run(store.mutate(a, "test", { shape: "item", facts: {} }));
+  const source = await run(store.mutate(a, "test", { shape: "item", facts: { [attribute]: target.id } }));
+  await expect(
+    duringPreflight(Effect.flip(store.apply(a, "admin", desired, 1)), () => run(store.remove(a, "writer", target.id))),
+  ).resolves.toMatchObject({ _tag: "Conflict", issues: [{ field: `${source.id}.facts.${attribute}`, issue: "Dangling reference" }] });
+  expect((await run(store.getRegistry(a))).version).toBe(1);
+});
+
+test("apply stages retractions from the post-snapshot version of an entity", async () => {
+  const a = account();
+  const initial = {
+    attributes: [
+      { key: "test/drop", type: "integer" },
+      { key: "test/keep", type: "integer" },
+    ],
+    shapes: [{ key: "item", attributes: ["test/drop", "test/keep"] }],
+    automations: [],
+  };
+  const desired = { ...initial, shapes: [{ key: "item", attributes: ["test/keep"] }] };
+  await run(store.apply(a, "test", initial, 0));
+  const e = await run(store.mutate(a, "test", { shape: "item", facts: { "test/drop": 1, "test/keep": 2 } }));
+  await duringPreflight(store.apply(a, "admin", desired, 1), () =>
+    run(store.mutate(a, "writer", { facts: { "test/drop": 3, "test/keep": 4 } }, e.id)),
+  );
+  const current = await run(store.getLive(a, e.id));
+  expect(current).toMatchObject({ facts: { "test/keep": 4 }, version: 3, registry_version: 2 });
+  expect((await run(store.history(a, e.id))).data.at(-1)).toMatchObject({ op: "retract", value: 3, reason: "migration" });
+  expect(await run(store.asOf(a, e.id, current.updated_at))).toEqual(current);
+});
+
 test("a replacement store continues the database clock", async () => {
   const a = await seed();
   const first = await run(store.mutate(a, "test", { shape: "employee", facts: { "person/email": "before-restart" } }));
@@ -521,10 +618,18 @@ test("forced hash collisions compare exact values and retain database uniqueness
   expect(
     await run(Effect.result(collisionStore.mutate(a, "test", { shape: "employee", facts: { "person/email": "first-distinct" } }))),
   ).toMatchObject({ _tag: "Failure", failure: { _tag: "Conflict", issues: [{ field: "facts.person/email" }] } });
+  const relaxed = fixture();
+  relaxed.attributes = relaxed.attributes.map((attr) => (attr.key === "person/email" ? { ...attr, unique: false } : attr));
+  await run(collisionStore.apply(a, "test", relaxed, 1));
+  const escaped = "third\u0000\ud800";
+  await run(collisionStore.mutate(a, "test", { shape: "employee", facts: { "person/email": escaped } }));
+  await run(collisionStore.apply(a, "test", fixture(), 2));
+  const reused = await run(Effect.flip(collisionStore.mutate(a, "test", { shape: "employee", facts: { "person/email": escaped } })));
+  expect(reused).toMatchObject({ _tag: "Conflict", issues: [{ field: "facts.person/email" }] });
   const values = await run(
     store.sql<{ count: string }>`SELECT count(*)::text AS count FROM unique_values WHERE account_id=${a} AND hash='forced-collision'`,
   );
-  expect(values[0]!.count).toBe("2");
+  expect(values[0]!.count).toBe("3");
 });
 
 test("compiled registry cache evicts least recently used entries at 1000", async () => {

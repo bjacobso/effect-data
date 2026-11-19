@@ -20,6 +20,7 @@ import { evaluator } from "./rules.ts";
 import { valueSchema } from "./values.ts";
 import { KindRegistry, type RegisteredKind } from "./registry.ts";
 import type { RegistryImpact } from "./registryImpact.ts";
+import { reviewIssues, type EntityReview, type Violation } from "./registryReview.ts";
 
 const entitySchema = (attributes: ReadonlyMap<string, Schema.Codec<unknown>>, shape: Shape, keys: Iterable<string>) =>
   Schema.Struct(
@@ -94,14 +95,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
     if (!s) return [issue("shape", "Unknown shape")];
     return decodeIssues(compile(r).schemas.get(shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue));
   }
-  function plan(
-    current: Registry,
-    desired: Registry,
-    live: Entity[],
-    version = 0,
-    phase?: (name: string) => void,
-    scope?: { impact: RegistryImpact; targets: ReadonlyMap<string, string> },
-  ) {
+  function preparePlan(current: Registry, desired: Registry, version: number, phase?: (name: string) => void, scope?: RegistryImpact) {
     phase?.("registry checks and diff");
     current = normalize(current);
     desired = normalize(desired);
@@ -116,64 +110,80 @@ export function engine(kinds: readonly RegisteredKind[]) {
         else if (canonical(old.get(key)) !== canonical(next.get(key))) changes.push({ kind: k.name, key, change: "modified" });
       }
     }
-    phase?.("entity revalidation");
-    const violations: (Issue & { entity_id: string })[] = [],
-      seen = new Set<string>();
     const valid = !issues.length;
     const edges = attributeEdges(desired.attributes);
     const shapes = new Map(desired.shapes.map((s) => [s.key, s]));
-    const targets = scope?.targets ?? new Map(edges.size ? live.filter((e) => shapes.has(e.shape)).map((e) => [e.id, e.shape]) : []);
     const schemas = new Map<string, Schema.Codec<Facts>>();
-    if (valid && (!scope || scope.impact.shapes.size)) {
+    if (valid && (!scope || [...scope.shapes.values()].some((impact) => impact.fields.size))) {
       const attributes = new Map(desired.attributes.map((a) => [a.key, valueSchema(a)]));
       for (const s of desired.shapes) {
-        const keys = scope ? scope.impact.shapes.get(s.key)?.fields : s.attributes;
-        if (keys && (!scope || scope.impact.shapes.get(s.key)!.fields.size)) schemas.set(s.key, entitySchema(attributes, s, keys));
+        const fields = scope?.shapes.get(s.key)?.fields;
+        if (!scope || fields?.size) schemas.set(s.key, entitySchema(attributes, s, fields ?? s.attributes));
       }
     }
-    if (valid || edges.size) {
-      const hasUnique = scope ? [...scope.impact.shapes.values()].some((s) => s.unique.size > 0) : desired.attributes.some((a) => a.unique);
-      for (const e of hasUnique ? [...live].sort((a, b) => compare(a.id, b.id)) : live) {
-        const impact = scope?.impact.shapes.get(e.shape);
-        if (scope && !impact) continue;
-        const s = shapes.get(e.shape),
-          facts = s ? retain(e.facts, s) : {};
-        const schema = schemas.get(e.shape);
-        const fields = impact ? Object.fromEntries(Object.entries(facts).filter(([key]) => impact.fields.has(key))) : facts;
-        const errors = schema
-          ? decodeIssues(schema, fields).map((x) => issue(`facts.${x.field}`, x.issue))
-          : valid && !s
-            ? [issue("shape", "Unknown shape")]
-            : [];
-        for (const [k, v] of Object.entries(facts)) {
-          const edge = !impact || impact.refs.has(k) ? edges.get(k) : undefined;
-          if (edge && (typeof v !== "string" || targets.get(v) !== edge.target)) {
-            const field = `facts.${k}`;
-            const existing = errors.findIndex((x) => x.field === field);
-            if (existing >= 0) errors.splice(existing, 1);
-            errors.push(issue(field, "Dangling reference"));
-          }
-          if (valid && (impact ? impact.unique.has(k) : findAttribute(desired, k)?.unique)) {
-            const identity = canonical([k, v]);
-            if (seen.has(identity)) errors.push(issue(`facts.${k}`, "Duplicate unique value"));
-            else seen.add(identity);
-          }
-        }
-        violations.push(...errors.map((x) => ({ entity_id: e.id, ...x })));
+    const members = new Map(desired.shapes.map((s) => [s.key, new Set(s.attributes)]));
+    const unique = new Set(valid ? desired.attributes.filter((a) => a.unique).map((a) => a.key) : []);
+    function inspect(e: Entity): EntityReview | undefined {
+      const impact = scope?.shapes.get(e.shape);
+      if (scope && !impact) return;
+      const accepted = members.get(e.shape);
+      if (!accepted) return valid ? { issues: [issue("shape", "Unknown shape")], refs: [], slots: [] } : undefined;
+      const schema = schemas.get(e.shape);
+      const refKeys = impact?.refs ?? edges;
+      const uniqueKeys = valid ? (impact?.unique ?? unique) : unique;
+      if (!schema && !refKeys.size && !uniqueKeys.size) return;
+      const fields: Facts = {};
+      const refs: EntityReview["refs"] = [];
+      const slots: EntityReview["slots"] = [];
+      for (const [key, value] of Object.entries(e.facts)) {
+        if (!accepted.has(key)) continue;
+        if (schema && (!impact || impact.fields.has(key))) fields[key] = value;
+        if (refKeys.has(key)) refs.push({ key, value, target: edges.get(key)!.target });
+        if (uniqueKeys.has(key)) slots.push({ key, identity: canonical([key, value]) });
       }
+      const errors = schema ? decodeIssues(schema, fields).map((x) => issue(`facts.${x.field}`, x.issue)) : [];
+      if (errors.length || refs.length || slots.length) return { issues: errors, refs, slots };
     }
-    violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field));
-    phase?.("apply overhead");
-    return {
+    const finish = (violations: Violation[]) => ({
       from_version: version,
       to_version: version + 1,
       applicable: !issues.length && !violations.length,
       issues,
       changes,
-      violations,
-    };
+      violations: violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field)),
+    });
+    return { issues, finish, inspect, shapes, hasRefs: edges.size > 0, hasUnique: unique.size > 0 };
   }
-  return { kinds, fields, payload, empty, normalize, structure, check, compile, validate, plan };
+  function plan(
+    current: Registry,
+    desired: Registry,
+    live: Entity[],
+    version = 0,
+    phase?: (name: string) => void,
+    scope?: { impact: RegistryImpact; targets: ReadonlyMap<string, string> },
+  ) {
+    const prepared = preparePlan(current, desired, version, phase, scope?.impact);
+    phase?.("entity revalidation");
+    const targets =
+      scope?.targets ?? new Map(prepared.hasRefs ? live.filter((e) => prepared.shapes.has(e.shape)).map((e) => [e.id, e.shape]) : []);
+    const seen = new Set<string>(),
+      violations: Violation[] = [];
+    for (const e of prepared.hasUnique ? [...live].sort((a, b) => compare(a.id, b.id)) : live) {
+      const review = prepared.inspect(e);
+      if (!review) continue;
+      violations.push(
+        ...reviewIssues(e.id, review, targets, (identity) => {
+          if (seen.has(identity)) return true;
+          seen.add(identity);
+          return false;
+        }),
+      );
+    }
+    const result = prepared.finish(violations);
+    phase?.("apply overhead");
+    return result;
+  }
+  return { kinds, fields, payload, empty, normalize, structure, check, compile, validate, plan, preparePlan };
 }
 function natural(a: string, b: string): number {
   const tokens = (s: string) => s.match(/[a-z_]+|[0-9]+/g) ?? [];
