@@ -618,3 +618,495 @@ handler-service dependencies inside its handler Layer. The main remaining
 composition rough edge is the phantom HttpApi group identifier widening at a
 heterogeneous boundary; each group's endpoint schemas and handlers remain
 checked inside its own module.
+
+
+## Pass 4
+
+The existing black-box cases now run as TypeScript programs in Node. They use
+Effect HttpClient, independent wire schemas, typed assertion failures, and
+NodeRuntime. The housekeeping commit `b89ff5c` also includes the supplied
+PLAN.md and MIT LICENSE. The license contents were committed as supplied.
+
+### Verification
+
+- `make deps migrate test` passed **39 tests across four suites**, including
+  TypeScript checking. A second `make migrate` passed.
+- `data.ts` passed **15/15** with `PACKS=onboarding` and **15/15** with the
+  default packs. With default packs, `data-certs.ts` passed **6/6** and
+  `data-refs.ts` passed **7/7**, including 50 create-versus-delete races.
+- The reference-completeness property ran 100 generated registries and compared
+  exact issue paths for removing an attribute or a target shape. The replay
+  property ran 12 generated sequences, each with a guaranteed blocked delete
+  and clear cascade. After each action it compared live projections with an
+  independent model and history fold, and compared the SQL edges with those
+  recomputed from the projections. Saved states were replayed with `as_of`.
+- The API servers used for verification were stopped. The benchmark used the
+  dedicated `onb_data_bench` database.
+
+### Matched Store benchmark
+
+Both runs used the same script, Node 26.13.0 and PostgreSQL 17.11 on an Apple
+M2 Max with 32 GiB of RAM. The script bulk-seeded consistent projections,
+events, facts and clocks outside the timed intervals. It used 1,000,000
+entities in `bench_big` and 32 per account across 100 small accounts. The
+registry defined 200 mixed-type attributes. The shape initially included 199,
+with seven populated facts per entity. The timed apply attached the last
+attribute as optional and revalidated the million live entities.
+
+Each PATCH workload ran 16 workers with 50 warm-up and 250 measured writes
+per worker. Both versions patched the same sources and alternated the same
+two live target IDs per account. The baseline defined `bench/link` as a
+string. The refs run declared it as a ref targeting the benchmark shape and
+seeded its live edges. The application path for all measured operations was
+the Store. A PostgreSQL observer polled the advisory lock at 1 ms intervals
+to estimate lock hold time independently of application wall time. Each
+`as_of` fixture had 30 measured reads after warm-up.
+
+| Metric | Baseline | Refs |
+| --- | ---: | ---: |
+| PATCH one account (writes/s) | 1,801 | 1,717 |
+| PATCH one account p50 / p95 / p99 (ms) | 3.12 / 32.08 / 56.63 | 6.80 / 26.79 / 43.12 |
+| PATCH across 100 accounts (writes/s) | 3,102 | 2,824 |
+| PATCH across 100 accounts p50 / p95 / p99 (ms) | 4.54 / 8.15 / 9.37 | 4.98 / 9.08 / 13.28 |
+| Registry apply wall time (s) | 81.575 | 75.697 |
+| Registry apply exclusive lock (s) | 81.575 | 75.698 |
+| `as_of` with 10 history rows p50 / p95 / p99 (ms) | 0.132 / 0.232 / 0.251 | 0.124 / 0.192 / 0.218 |
+| `as_of` with 1,000 history rows p50 / p95 / p99 (ms) | 1.510 / 2.084 / 2.860 | 1.484 / 1.913 / 2.707 |
+| `as_of` with 10,000 history rows p50 / p95 / p99 (ms) | 15.743 / 45.191 / 46.436 | 13.072 / 13.867 / 14.735 |
+
+PATCH throughput fell 4.7% on one busy account and 8.9%
+when spread across 100 accounts. Both benchmark registries reached version 2
+with 200 attributes in the shape and identical big-account transaction
+counts. The refs run had 1,003,200 live edges, one per seeded entity.
+The normal `onb_data` database had zero benchmark registries.
+[Baseline results](bench/results-baseline.json) · [Refs results](bench/results-refs.json)
+
+These are single runs with sparse facts and local database traffic. The lock
+estimate can differ from wall time by a sampling interval. Registry apply
+materializes live documents and still performs per-entity uniqueness work
+under the exclusive account lock. The unchanged history replay path makes the
+observed `as_of` differences a useful indication of run-to-run variability.
+
+### How refs fit the primitives
+
+The existing Kind protocol resolves the attribute's target shape and reports
+declaration issues. The entity ID pattern revives through Effect's built-in
+pattern reviver and appears in exported JSON Schema. The existing typed-rule
+checks already reject ordering, substring operators and `ignore_case` for
+the new type. They reuse the value decoder for operands. The `set` op keeps
+its schema and instruction, and live uniqueness uses the existing index path.
+
+The configuration reference checker can resolve a shape name. Entity
+integrity also needs an account-scoped live lookup, a transaction lock and an
+indexed reverse projection. The compiled `edges` map carries the target
+shape and delete policy into storage. Storage validates those relationships
+on create, PATCH and each automation set. It uses `FOR KEY SHARE` for target
+rows, `FOR NO KEY UPDATE` for mutation sources, and `FOR UPDATE` for deletes,
+under shared account locks. PostgreSQL deadlock victims retry the write
+transaction with bounded backoff. A clear rechecks the fact after acquiring
+the referrer's row lock and stages a later transaction for each retraction.
+The fact and edge changes commit together. History and `as_of` still read
+the original events and facts.
+
+A generic extension for further relationship types would need a descriptor
+for live destination identity, transaction-time validation and locking,
+inverse lookup, and actions on delete or registry migration. This pass uses
+one descriptor and one interpreter for the two supported delete policies.
+
+### Source size
+
+Physical lines at the checked-in Prettier width, including imports, comments
+and blank lines.
+
+| Core file | Before | After | Net |
+| --- | ---: | ---: | ---: |
+| `model.ts` | 89 | 91 | +2 |
+| `values.ts` | 36 | 37 | +1 |
+| `kinds.ts` | 135 | 155 | +20 |
+| `rules.ts` | 170 | 170 | 0 |
+| `engine.ts` | 168 | 183 | +15 |
+| `registry.ts` | 13 | 13 | 0 |
+| **Core total** | **611** | **649** | **+38** |
+
+Core is **42 lines below** the +80 target. Non-test `src/` is **1,880 lines**
+against the original 1,200-line target, up from 1,683. The increase consists
+of 38 core lines, 142 storage lines, 14 HTTP lines and three migration-wiring
+lines. Storage carries the target locks, edge reconciliation and ordered
+cascade work.
+
+### Files touched outside core
+
+| Files | Change |
+| --- | --- |
+| `PLAN.md`, `LICENSE` | Commit the supplied pass plan and MIT license in the housekeeping commit. |
+| `README.md` | Document the converted conformance commands, ref behavior and benchmark setup. |
+| `conformance/data.mjs`, `conformance/data-certs.mjs` | Replaced by TypeScript suites. |
+| `conformance/data.ts`, `conformance/data-certs.ts` | Port the existing cases and assertions. |
+| `conformance/client.ts` | Share the external Effect client, wire decoders and typed runner. |
+| `conformance/data-refs.ts` | Exercise the wire contract, rollback, replay and the 50-attempt race. |
+| `test/core.test.ts`, `test/storage.test.ts` | Extend declaration, rule, value, impact and generated replay coverage. |
+| `migrations/0003_live_refs.ts`, `src/Migrations.ts` | Add and register the edge table, reverse index and history reason. |
+| `src/storage/Store.ts`, `src/storage/liveRefs.ts` | Validate target rows, project edges, reconcile registry changes and interpret delete policy transactionally. |
+| `src/http/handler.ts` | Expose referrers and describe the new history reason. |
+| `bench/run.ts`, `bench/results-baseline.json`, `bench/results-refs.json` | Deterministic fixture, Store workloads and measured outputs. |
+| `Makefile`, `package.json`, `tsconfig.json`, `.gitignore` | Wire benchmark, format and type-check commands, and ignore smoke outputs. |
+| `REPORT.md` | Record the measured comparison and verification. |
+
+## Pass 5
+
+### Bulk-insert regression
+
+Pass 5 found that `flush` sent all staged rows for a table in one statement.
+A registry apply retracting a populated attribute from 10,000 entities
+exceeded PostgreSQL's 65,535 bind-parameter limit and rolled back. Events,
+facts, entity projections and outbox rows now use bounded inserts inside the
+original transaction. The storage regression checks all 10,000 committed
+retractions and verifies that history and `as_of` replay across batch
+boundaries.
+
+### Pass 5 investigation
+
+The benchmark drives `Store` against the existing `onb_data_bench` database.
+The `bench_big` fixture has 1,000,000 live entities, 199 initial shape
+members, seven populated facts per entity and one live ref per entity. Each
+apply launches 16 one-shot PATCH requests to the same account when the
+exclusive lock is acquired. Lock time is measured from the lock statement's
+return through completion of the transaction. This includes the client-side
+completion of `COMMIT` or `ROLLBACK`. The SQL counters count statements
+dispatched through Effect's SQL statement transformer. The driver's
+transaction-control statements add one `BEGIN` and one `COMMIT` or
+`ROLLBACK` per attempt. Phase timings include client and server work between
+the instrumentation points.
+
+The make-unique apply had already rolled back on a 30,000-entity fixture
+with PostgreSQL's `out of shared memory` error. The advisory locks are held
+until transaction end. PostgreSQL was left at `max_locks_per_transaction=64`,
+`max_connections=100`, and `max_prepared_transactions=0`.
+
+In the supplemental 30,000-entity run, make-unique rolled back with the
+same error after 4.954 s and left the registry version and live unique slots
+untouched. Removal finished after 12.827 s. Its staging issued 60,000
+uniqueness deletes and its flush spent 8.256 s on assembly and inserts.
+[30,000-entity measurements](bench/results-pass5-investigation-30000.json)
+· [Node CPU profile](bench/pass5-investigation-30000.cpuprofile.gz)
+
+The 30,000-entity `--cpu-prof` profile attributes most attach-optional time
+to idle waits. The top active frames include Effect Schema's `stepProperty`,
+Effect's `fromIteratorEagerUnsafe` and `runSequential`, and the core's
+`compare`. During removal the two frames on `flush`'s `steps.findLast`
+lookup account for about 5.9 s of sampled time. With one migration step per
+entity, the lookup examines about 500 billion entries at one million
+retractions.
+
+A focused, one-million-entity run of the same Phase A code profiled
+attach-optional separately. Of 86.18 s wall time, the top sampled frames
+were `(idle)` at 50.53 s, `stepProperty` at 4.78 s,
+`fromIteratorEagerUnsafe` at 3.76 s, `compare` at 3.62 s and `writeBuffer`
+at 2.36 s. `onItem` and `parseChecks` contributed another 3.67 s of
+sampled schema work. [Focused measurements](bench/results-pass5-investigation-focused.json)
+· [Full-size attach CPU profile](bench/pass5-attach-1000000.cpuprofile.gz)
+
+#### One-million-entity apply phases
+
+Each cell gives milliseconds / statements. Rollback time falls in the last
+measured phase for make-unique.
+
+| Phase | Attach optional | Make unique (rollback) | Remove populated |
+| --- | ---: | ---: | ---: |
+| Start transaction | 0.276 / 0 | 0.765 / 0 | 0.159 / 0 |
+| Wait for account lock | 0.252 / 1 | 0.387 / 1 | 0.150 / 1 |
+| Read registry | 0.975 / 1 | 2.782 / 1 | 0.530 / 1 |
+| Load and parse live entities | 1,575.752 / 1 | 1,574.729 / 1 | 1,343.570 / 1 |
+| Registry checks and diff | 2.232 / 0 | 2.528 / 0 | 1.667 / 0 |
+| Entity revalidation | 20,185.055 / 0 | 21,182.785 / 0 | 19,671.444 / 0 |
+| Plan-to-stage overhead | 0.338 / 0 | 0.130 / 0 | 0.037 / 0 |
+| Staging, uniqueness and edges | 61,946.675 / 1,000,000 | 5,365.678 / 75,153 | 117,352.171 / 2,000,000 |
+| Registry write | 7.941 / 1 | — | 1.146 / 1 |
+| Clock reserve | — | — | 0.778 / 1 |
+| Flush inserts and assembly | — | — | 35,751,911.700 / 338 |
+| Transaction completion | 1.218 / 0 | — | 4.852 / 0 |
+
+- **H1 confirmed.** Attach-optional issued one `live_unique` `DELETE` per
+  entity, even without a unique attribute. Retractions called it in both
+  `stage` and the apply loop, issuing two million deletes at full size.
+- **H2 confirmed.** Registry checks and the diff took 2.2 ms for the
+  one-million-entity attach. Revalidation took 20.19 s, including sorting,
+  retained facts, references and Effect Schema decoding. The profile shows
+  property decoding among the top active frames.
+- **H3 confirmed.** Attach loaded and parsed a million documents in 1.58 s.
+  RSS crossed 1.02 GiB immediately after the load and peaked at 1.12 GiB.
+  The process peak reached 2.66 GiB during removal.
+- **H4 confirmed.** For the attach, 83.720 s of the 83.721 s wall time fell
+  inside the exclusive lock. Same-account PATCH p50 and p99 were both about
+  83.75 s.
+
+The original removal completed with an exclusive lock hold of 9 h 58 min
+10 s. The two frames around the projection lookup at `Store.ts:199` and
+`:203` account for about 35,609 s in the full run's Node CPU profile. A
+native process sample at seven hours resolved the stack to
+`ArrayPrototypeFindLast` under `ArrayMap`. The original version 3 fixture
+committed one million migration retractions with zero live projections
+retaining `bench/state`. [Full investigation measurements](bench/results-pass5-investigation.json)
+
+#### PATCH and `as_of` breakdown at one million entities
+
+The full investigation gathered the following average phase times in
+milliseconds. Each PATCH sent 10 statements plus
+`BEGIN` and `COMMIT`. The seven single-statement steps were account lock,
+entity read, registry read, ref validation, uniqueness, ref update and clock
+reservation. The flush sent three inserts.
+
+| PATCH phase | 1 worker | 16 workers, one account |
+| --- | ---: | ---: |
+| Transaction startup | 0.093 | 0.091 |
+| Account lock | 0.061 | 0.063 |
+| Entity read | 0.096 | 0.080 |
+| Registry read | 0.129 | 0.117 |
+| Decode | 0.041 | 0.029 |
+| Ref validation | 0.093 | 0.100 |
+| Staging and automations | 0.013 | 0.010 |
+| Uniqueness | 0.080 | 0.079 |
+| Ref update | 0.102 | 0.128 |
+| Clock reserve | 0.081 | 8.207 |
+| Flush | 0.291 | 0.333 |
+| Transaction completion | 0.180 | 0.237 |
+| Writes/s | 783 | 1,636 |
+| PATCH p50 / p99 (ms) | 1.139 / 3.278 | 7.272 / 42.587 |
+
+`as_of` uses two statements per read. SQL includes driver transfer and row
+decoding. Each latency used 30 samples.
+
+| History facts | SQL rows (events + facts) | Average SQL ms | Average replay ms | p50 / p99 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 14 | 0.243 | 0.003 | 0.206 / 0.592 |
+| 1,000 | 1,994 | 2.068 | 0.099 | 1.956 / 5.169 |
+| 10,000 | 19,994 | 12.151 | 0.648 | 12.729 / 13.791 |
+
+### Apply fixes at one million live entities
+
+Each result includes 16 concurrent PATCH samples to the apply account.
+Fix runs used the same fixture with a different account key and schema so
+their database-wide advisory locks were independent of the investigation.
+The timings are individual local runs. The investigation used `--cpu-prof`.
+
+| Step | Apply | Wall s | Exclusive lock s | PATCH p50 / p99 ms |
+| --- | --- | ---: | ---: | ---: |
+| A | Attach optional | 83.721 | 83.720 | 83,750.67 / 83,757.43 |
+| A | Make unique (rollback) | 28.130 | 28.129 | 28,135.15 / 28,141.13 |
+| A | Remove populated | 35,890.288 | 35,890.288 | 35,890,369.29 / 35,890,380.28 |
+| B1 | Attach optional | 21.494 | 21.493 | 21,516.32 / 21,527.29 |
+| B1 | Make unique | 273.190 | 273.189 | 273,228.11 / 273,236.29 |
+| B1 | Remove populated | 150.206 | 150.206 | 151,912.29 / 151,986.39 |
+| B2 | Attach optional | 0.008 | 0.007 | 18.45 / 23.05 |
+| B2 | Make unique | 253.079 | 253.079 | 253,128.44 / 253,140.27 |
+| B2 | Remove populated | 336.538 | 336.537 | 336,887.73 / 336,899.49 |
+| B3 | Attach optional | 0.009 | 0.002 | 14.69 / 18.80 |
+| B3 | Make unique | 47.998 | 37.474 | 37,509.61 / 37,518.59 |
+| B3 | Remove populated | 128.017 | 118.361 | 118,626.59 / 118,639.48 |
+
+B1 leaves the uniqueness slots of unchanged entities untouched. Registry
+apply already excludes writers to its account, so newly unique values can
+be interned without taking individual advisory locks. The 30,000-entity
+regression verifies that enabling uniqueness commits and that subsequent
+duplicate writes fail. Attach's staging went from one million statements to
+zero. Make-unique committed with four statements per added slot. For removal
+the linear projection assembly eliminated the repeated step lookup, then
+flush took 125.27 s across 338 bulk inserts. [B1 measurements](bench/results-pass5-b1.json)
+
+B2 classifies changed constraints in core and uses an index on creation
+events to select live entities of the affected shapes. Ref checks can read
+target ids and their shapes without loading the target documents. The
+400-case differential property compares classified output with full
+revalidation of valid live projections, including invalid desired
+registries, duplicate values and ref changes. Attach needed no live-entity
+statement or decode and held the lock for 6.91 ms. Make-unique still spent
+240.10 s in slot writes. Removal revalidation fell from 19.28 s to 1.15 s.
+Its same 338 bulk inserts plus assembly took 328.16 s in this run, compared
+with 125.27 s in B1. [B2 measurements](bench/results-pass5-b2.json)
+
+B3 pages affected live entities in a repeatable-read snapshot at a recorded
+account tx. It prepares validation results, uniqueness slots and
+retractions before taking the account lock. The write transaction checks
+the registry version again and reads the event tail. Changes to a unique
+value or ref target also update the checks that depend on it. Storage tests
+cover a new duplicate, a repaired duplicate, a concurrently deleted ref
+target and a write to an entity about to undergo a migration retraction.
+
+The one-million-row snapshot used 201 page reads for each expensive apply.
+`EXPLAIN` showed an index-only scan on creation events and primary-key
+lookups on live projections for a page of 5,000 candidates.
+Make-unique moved 10.52 s before the lock and reduced uniqueness statements
+from four million to 200. Inserting the million slots and their interned
+values still took 37.46 s under the lock. Removal moved 9.66 s before the
+lock and spent 118.22 s in the atomic flush of events, facts and
+projections. The resulting version 4 fixture had exactly one million
+migration retractions and zero live projections retaining `bench/state`.
+[B3 measurements](bench/results-pass5-b3.json)
+
+### Targets and remaining costs
+
+- **Attach optional met the target.** The exclusive lock held for 2.21 ms
+  against the 100 ms target. Concurrent PATCH p99 fell from 83.76 s to
+  18.80 ms.
+- **Make unique missed the target.** The exclusive lock held for 37.47 s
+  against the 5 s target. Writing one million uniqueness slots and their
+  interned values in one transaction dominates that time. A later pass can
+  investigate preparing those projections outside the exclusive transaction
+  and catching them up before cutover.
+- **Remove populated held the lock for 118.36 s, down from 9 h 58 min.** The
+  atomic write of the million retractions dominates. An online migration
+  would need to stage these writes and make them visible together at cutover.
+
+Phase C was skipped. With 16 PATCH workers on one account, reservation of
+the per-account clock dominates. The clock row serializes allocation of
+`tx` and `at` through commit, so shortening that critical section requires
+more than removing a single round trip. For `as_of`, an indexed lookup of
+the latest event at the requested time and the latest fact for each
+historical attribute at that event's `tx` could bring the 10,000-row
+fixture from 19,994 returned rows to eight. That would eliminate client
+replay and reduce result transfer. The SQL plan would need to be measured
+separately to quantify server-side savings.
+
+### Source size and verification
+
+Physical TypeScript lines from the Phase 0 commit to the end of B3.
+
+| Source layer | Before | After | Net |
+| --- | ---: | ---: | ---: |
+| Core | 649 | 842 | +193 |
+| Storage | 505 | 697 | +192 |
+| HTTP | 351 | 351 | 0 |
+| Packs | 292 | 292 | 0 |
+| Composition and migration wiring | 97 | 98 | +1 |
+| **Total `src/`** | **1,894** | **2,280** | **+386** |
+
+The source exceeds the original 1,200-line budget. The pass adds scoped
+validation and dependency tracking in core, snapshot preparation and batch
+projection writes in storage, and phase timing at both layers. The
+additional SQL migration adds a nine-line index definition outside `src/`.
+
+`make test` passed all 45 tests. Against `make run`, `data.ts` passed 15/15,
+`data-certs.ts` passed 6/6, and `data-refs.ts` passed 7/7. With
+`PACKS=onboarding`, `data.ts` passed 15/15 again. Both server runs were
+stopped.
+
+## Pass 6
+
+### Rollout and storage decisions
+
+The server worker takes the shared account advisory lock, then claims the
+running job row with `FOR UPDATE SKIP LOCKED`. The row lock, projection writes,
+outbox writes and phase/cursor update share one transaction. A crashed worker
+releases its claim on rollback. Another worker can continue from the last
+committed cursor without a separate lease or timeout. A superseding apply
+restarts the union of affected shapes under the new registry. The job
+performs a full release pass before entering the claim phase when the change
+can invalidate slots. For claim-only changes it starts in the claim phase.
+
+The worker starts with batches of 1,000 creation ids and serializes with entity
+writes on the affected rows. A bounded set of per-account value lock stripes
+coordinates value interning, slot claims and promotions with writers. The
+exclusive account lock covers all strict slot releases and claims. A strict
+apply also rebuilds inherited slots if it supersedes a running job. This
+covers values changed while an earlier rollout was releasing their old slots.
+A single SQL statement reserves the clock position, installs the registry,
+records its history and changes rollout metadata.
+
+Registry history distinguishes a first optional attachment from restoring a
+previous member. A first attachment and removal of a non-unique, non-ref fact
+can finish with an empty job scope. Such a rollout row is immediately done.
+A plan reports `blocking` on each violation. The plan and a strict preflight
+consider pending work and existing open records against the proposed registry.
+The rollout preflight skips duplicate-only work and the worker reconciles
+duplicates against committed data.
+
+A ref restored from hidden storage can produce a dangling record even when the
+same apply changes its type to ref. If the restored value fails the new type's
+decoder, the apply still fails. Retargeting a visible ref that makes an open
+record valid resolves the record in the registry transaction. A target's
+shape and id are immutable, so a write repairs the dangling reference by
+changing or retracting the source value. The worker leaves the ref projection
+in place across visibility changes. Type changes to and from ref still do
+synchronous projection work under the exclusive lock, including for hidden
+facts. The projection can store malformed legacy values on conversion while
+hidden, using their JSON encoding so those values cannot match a target id.
+
+Entity metadata keeps the last entity write's version, registry version and
+timestamps. Historical reads use registry history for visibility and show
+violation records open at the requested time. Hidden values occupy storage
+and have no purge path. A hidden unique value can still block a write until
+the release phase reaches it. PostgreSQL configuration was unchanged.
+
+### Verification and source size
+
+`make test` passed all 53 tests, including a 20-case randomized rollout
+projection comparison with writes between batches, superseding changes, a
+replacement Store resuming from the persisted cursor, and strict and
+background slot moves between shapes.
+
+With `BASE_URL=http://localhost:8086` against `make run`, `data.ts` passed
+15/15, `data-certs.ts` passed 6/6, `data-refs.ts` passed 7/7 and the new
+`data-rollout.ts` passed 3/3. With `PACKS=onboarding`, `data.ts` passed 15/15
+again. Both application server runs were stopped.
+
+The existing data suite now uses retirement for plans that remove a key
+from use and strict mode for its combined duplicate and blocking violations
+case. It checks soft removal and reads with the new registry and entity
+metadata. The certification suite retires the expiry attribute to keep its
+dependency-check scenario and expects rollout metadata on registry GET.
+The ref suite checks the blocking flag on incompatible conversions and
+retargeting. The new suite checks duplicate enforcement and resolution,
+outbox events, soft removal, retirement and restored dangling refs.
+
+| TypeScript layer | Pass 5 | Pass 6 | Net |
+| --- | ---: | ---: | ---: |
+| Core | 842 | 939 | +97 |
+| Storage | 697 | 1,247 | +550 |
+| HTTP | 351 | 417 | +66 |
+| Packs | 292 | 290 | −2 |
+| Composition and migration wiring | 98 | 116 | +18 |
+| **Total `src/`** | **2,280** | **3,009** | **+729** |
+| SQL migrations | 55 | 106 | +51 |
+| Tests | 1,445 | 1,714 | +269 |
+| Conformance | 1,669 | 1,871 | +202 |
+
+The original 1,200-line source budget remains exceeded. Most growth this pass
+is the batched rollout worker and transactional slot and violation handling.
+
+### One-million-entity benchmark
+
+The workload uses the same large-account shape as Pass 5, with 199
+initial members and seven populated facts per entity, including one ref.
+Every thousandth `bench/count` duplicates the preceding value. The
+duplicate-free `bench/ratio` drives the strict comparison after an untimed
+rollout removes the first uniqueness constraint. Removal hides the same
+populated non-unique `bench/state` member as Pass 5.
+
+The benchmark uses the Store directly and warms the connection pool with
+same-account PATCH writes on the seeded fixture. Apply lock time runs from
+lock acquisition through transaction completion. Each apply also starts 16
+same-account PATCH requests at lock acquisition. During the background
+job, 16 clients repeatedly toggle an unrelated boolean fact on the same
+account. Rollout duration measures worker execution from dispatch through
+the final committed batch. An empty job has zero processed entities and no
+during-rollout samples.
+
+| Apply | Apply wall (ms) | Exclusive lock (ms) | Rollout (s) | Entities/s | PATCH during apply p50 / p99 (ms) | PATCH during rollout p50 / p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Attach optional | 23.71 | 8.34 | 0 | — | 18.11 / 22.37 | — |
+| Make unique | 18.16 | 5.41 | 171.58 | 5,828 | 15.58 / 18.66 | 6.63 / 98.96 |
+| Remove populated | 20.50 | 9.21 | 0 | — | 15.36 / 20.27 | — |
+| Make unique, strict | 56,241.35 | 43,247.84 | — | — | 43,285.32 / 43,300.03 | — |
+
+All three rollout-mode applies met the 100 ms exclusive-lock target in
+the final warmed run. The make-unique worker visited one million entities
+and opened 1,000 duplicate records. The rollout PATCH p99 met the 100 ms
+target by about 1 ms across 186,953 samples. Attach optional and removal
+of the populated non-unique member completed with empty rollout scopes.
+
+Strict make-unique spent 43.22 s on 200 batches of locked slot writes.
+Its 43.25 s lock hold was in the same range as Pass 5's 37.47 s, and the
+concurrent writes waited for the lock. The final database contained one
+million strict uniqueness slots, all 1,000 duplicate records resolved by
+the untimed reset, one million retained hidden values, zero migration
+facts and zero running jobs. [Raw benchmark results](bench/results-pass6-current.json)

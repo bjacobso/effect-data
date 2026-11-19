@@ -1,0 +1,373 @@
+{
+  "mode": "pass6",
+  "measured_at": "2026-11-19T17:14:05.898Z",
+  "driver": "Store",
+  "database": "onb_data_bench",
+  "environment": {
+    "node": "v26.13.0",
+    "postgres": "17.11 (Homebrew)",
+    "cpu": "Apple M2 Max",
+    "memory_bytes": 34359738368
+  },
+  "fixture": {
+    "large_account": "bench_big_pass6",
+    "large_entities": 1000000,
+    "small_accounts": 0,
+    "entities_per_small_account": 32,
+    "attributes": 200,
+    "initial_shape_attributes": 199,
+    "initial_facts_per_entity": 7,
+    "workers": 16,
+    "writes_per_worker": 250
+  },
+  "patch": {
+    "warmup": {
+      "writes": 4000,
+      "wall_ms": 2464.436083000008,
+      "writes_per_second": 1623.0893662012606,
+      "p50_ms": 7.4349159999983385,
+      "p95_ms": 26.446500000020023,
+      "p99_ms": 38.966958000004524,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.09701070699960844,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.06910707850031769,
+          "statements": 0.9999999999999176
+        },
+        "entity read": {
+          "ms": 0.09056461324985869,
+          "statements": 0.9999999999999176
+        },
+        "registry read": {
+          "ms": 0.12690283475012984,
+          "statements": 0.9999999999999176
+        },
+        "decode": {
+          "ms": 0.03137921199955608,
+          "statements": 0
+        },
+        "ref validation": {
+          "ms": 0.11629925600020917,
+          "statements": 0.9999999999999176
+        },
+        "staging": {
+          "ms": 0.005038998499949229,
+          "statements": 0
+        },
+        "uniqueness": {
+          "ms": 0.08399058350002434,
+          "statements": 0.9999999999999176
+        },
+        "edge update": {
+          "ms": 0.14105839049996555,
+          "statements": 0.9999999999999176
+        },
+        "staging and automations": {
+          "ms": 0.0053632627500192105,
+          "statements": 0
+        },
+        "clock reserve": {
+          "ms": 8.281541089000164,
+          "statements": 0.9999999999999176
+        },
+        "flush inserts and assembly": {
+          "ms": 0.35185852700010545,
+          "statements": 3.0000000000000857
+        },
+        "transaction completion": {
+          "ms": 0.22319887624979276,
+          "statements": 0
+        }
+      }
+    }
+  },
+  "apply": {
+    "attach_optional": {
+      "rollout": {
+        "duration_ms": 0,
+        "entities": 0,
+        "entities_per_second": null,
+        "batches": 0,
+        "patch": null
+      },
+      "open_duplicate_records": 0,
+      "wall_ms": 23.708874999982072,
+      "exclusive_lock_ms": 8.339624999993248,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.6229999999923166,
+          "statements": 0
+        },
+        "preflight registry read": {
+          "ms": 7.846583999984432,
+          "statements": 3
+        },
+        "registry checks and diff": {
+          "ms": 6.097624999994878,
+          "statements": 0
+        },
+        "preflight validation and staging": {
+          "ms": 0.09429100001580082,
+          "statements": 0
+        },
+        "snapshot completion": {
+          "ms": 0.49624999999650754,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.21150000000488944,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 0.9347499999857973,
+          "statements": 1
+        },
+        "recheck concurrent writes": {
+          "ms": 0.020167000009678304,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 0.092333000007784,
+          "statements": 0
+        },
+        "registry write": {
+          "ms": 6.9777089999988675,
+          "statements": 1
+        },
+        "transaction completion": {
+          "ms": 0.31466599999112077,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 18.10695799998939,
+        "p95_ms": 22.3695000000007,
+        "p99_ms": 22.3695000000007
+      },
+      "max_rss_kib": 188288,
+      "rss_after_load_bytes": 192692224,
+      "lock_granted_monotonic_ms": 194588.177708,
+      "start_monotonic_ms": 194572.808458,
+      "end_monotonic_ms": 194596.517333
+    },
+    "make_unique": {
+      "rollout": {
+        "duration_ms": 171578.458,
+        "entities": 1000000,
+        "entities_per_second": 5828.2374818871485,
+        "batches": 1001,
+        "patch": {
+          "samples": 186953,
+          "p50_ms": 6.628999999986263,
+          "p95_ms": 53.334125000052154,
+          "p99_ms": 98.96287500002654
+        }
+      },
+      "open_duplicate_records": 1000,
+      "wall_ms": 18.162249999993946,
+      "exclusive_lock_ms": 5.4109580000222195,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.12724999999045394,
+          "statements": 0
+        },
+        "preflight registry read": {
+          "ms": 5.143707999988692,
+          "statements": 2
+        },
+        "registry checks and diff": {
+          "ms": 6.980209000001196,
+          "statements": 0
+        },
+        "preflight validation and staging": {
+          "ms": 0.013875000004190952,
+          "statements": 0
+        },
+        "snapshot completion": {
+          "ms": 0.31333299999823794,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.17291699998895638,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 0.6248330000089481,
+          "statements": 1
+        },
+        "recheck concurrent writes": {
+          "ms": 0.004291999997803941,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 0.007875000010244548,
+          "statements": 0
+        },
+        "registry write": {
+          "ms": 4.435708000004524,
+          "statements": 1
+        },
+        "transaction completion": {
+          "ms": 0.3382500000006985,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 15.582208000007086,
+        "p95_ms": 18.655415999994148,
+        "p99_ms": 18.655415999994148
+      },
+      "max_rss_kib": 220608,
+      "rss_after_load_bytes": 199524352,
+      "lock_granted_monotonic_ms": 194624.816542,
+      "start_monotonic_ms": 194612.06525,
+      "end_monotonic_ms": 194630.2275
+    },
+    "remove_populated": {
+      "rollout": {
+        "duration_ms": 0,
+        "entities": 0,
+        "entities_per_second": null,
+        "batches": 0,
+        "patch": null
+      },
+      "open_duplicate_records": 1000,
+      "wall_ms": 20.50104200001806,
+      "exclusive_lock_ms": 9.209083000023384,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.46691700001247227,
+          "statements": 0
+        },
+        "preflight registry read": {
+          "ms": 4.516957999963779,
+          "statements": 2
+        },
+        "registry checks and diff": {
+          "ms": 5.04629200004274,
+          "statements": 0
+        },
+        "preflight validation and staging": {
+          "ms": 0.08224999997764826,
+          "statements": 0
+        },
+        "snapshot completion": {
+          "ms": 0.7339170000050217,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.4456249999930151,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 0.48479100002441555,
+          "statements": 1
+        },
+        "recheck concurrent writes": {
+          "ms": 0.015625,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 0.08154199999989942,
+          "statements": 0
+        },
+        "registry write": {
+          "ms": 8.265458000008948,
+          "statements": 1
+        },
+        "transaction completion": {
+          "ms": 0.36166699999012053,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 15.361207999987528,
+        "p95_ms": 20.2697090000147,
+        "p99_ms": 20.2697090000147
+      },
+      "max_rss_kib": 220608,
+      "rss_after_load_bytes": 189988864,
+      "lock_granted_monotonic_ms": 366318.493792,
+      "start_monotonic_ms": 366307.201833,
+      "end_monotonic_ms": 366327.702875
+    },
+    "make_unique_strict": {
+      "rollout": null,
+      "open_duplicate_records": 0,
+      "wall_ms": 56241.34558299999,
+      "exclusive_lock_ms": 43247.835250000004,
+      "phases": {
+        "transaction startup": {
+          "ms": 1.0270419999724254,
+          "statements": 0
+        },
+        "preflight registry read": {
+          "ms": 10.420708000019658,
+          "statements": 3
+        },
+        "registry checks and diff": {
+          "ms": 8.502541999972891,
+          "statements": 0
+        },
+        "snapshot position": {
+          "ms": 0.4663750000181608,
+          "statements": 1
+        },
+        "preflight load": {
+          "ms": 9107.205127000867,
+          "statements": 201
+        },
+        "preflight validation and staging": {
+          "ms": 3863.607372999133,
+          "statements": 0
+        },
+        "snapshot completion": {
+          "ms": 1.8984160000109114,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.38274999998975545,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 2.719875000009779,
+          "statements": 1
+        },
+        "recheck concurrent writes": {
+          "ms": 5.589833999983966,
+          "statements": 1
+        },
+        "staging, uniqueness and edges": {
+          "ms": 43223.89762499998,
+          "statements": 200
+        },
+        "registry write": {
+          "ms": 9.114250000042375,
+          "statements": 2
+        },
+        "transaction completion": {
+          "ms": 6.513665999984369,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 43285.31912499998,
+        "p95_ms": 43300.025999999954,
+        "p99_ms": 43300.025999999954
+      },
+      "max_rss_kib": 848384,
+      "rss_after_load_bytes": 840138752,
+      "lock_granted_monotonic_ms": 480969.761833,
+      "start_monotonic_ms": 467976.2515,
+      "end_monotonic_ms": 524217.597083
+    }
+  },
+  "as_of": []
+}

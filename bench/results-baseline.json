@@ -1,0 +1,68 @@
+{
+  "mode": "baseline",
+  "measured_at": "2026-11-19T00:23:29.386Z",
+  "driver": "Store",
+  "database": "onb_data_bench",
+  "environment": {
+    "node": "v26.13.0",
+    "postgres": "17.11 (Homebrew)",
+    "cpu": "Apple M2 Max",
+    "memory_bytes": 34359738368
+  },
+  "fixture": {
+    "large_account": "bench_big",
+    "large_entities": 1000000,
+    "small_accounts": 100,
+    "entities_per_small_account": 32,
+    "attributes": 200,
+    "initial_shape_attributes": 199,
+    "initial_facts_per_entity": 7,
+    "workers": 16,
+    "writes_per_worker": 250
+  },
+  "patch": {
+    "busy": {
+      "writes": 4000,
+      "wall_ms": 2221.019499999995,
+      "writes_per_second": 1800.9747325496282,
+      "p50_ms": 3.116583000024548,
+      "p95_ms": 32.076459000003524,
+      "p99_ms": 56.62937499998952
+    },
+    "spread": {
+      "writes": 4000,
+      "wall_ms": 1289.4887920000183,
+      "writes_per_second": 3102.0044724824124,
+      "p50_ms": 4.543958000023849,
+      "p95_ms": 8.152999999991152,
+      "p99_ms": 9.373665999999503
+    }
+  },
+  "apply": {
+    "wall_ms": 81575.05958399997,
+    "exclusive_lock_ms": 81575.442
+  },
+  "as_of": [
+    {
+      "history_rows": 10,
+      "samples": 30,
+      "p50_ms": 0.13220799999544397,
+      "p95_ms": 0.2323749999923166,
+      "p99_ms": 0.25062499998603016
+    },
+    {
+      "history_rows": 1000,
+      "samples": 30,
+      "p50_ms": 1.5102090000000317,
+      "p95_ms": 2.0836249999993015,
+      "p99_ms": 2.8596660000039265
+    },
+    {
+      "history_rows": 10000,
+      "samples": 30,
+      "p50_ms": 15.743000000016764,
+      "p95_ms": 45.190792000008514,
+      "p99_ms": 46.436249999998836
+    }
+  ]
+}

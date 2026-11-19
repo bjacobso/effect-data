@@ -33,9 +33,8 @@ export const OnboardingHttpLive = HttpApiBuilder.group(api, "onboarding", (h) =>
         Effect.gen(function* () {
           const tenant = yield* Tenant,
             id = yield* entityId(params.id),
-            entity = yield* store.getLive(tenant.account, id),
-            { version, registry } = yield* store.getRegistry(tenant.account);
-          return evaluate(registry, entity, store.compiled(tenant.account, version, registry));
+            { entity, registry, config } = yield* store.readEntity(tenant.account, id);
+          return evaluate(registry, entity, config);
         }),
       ),
     );

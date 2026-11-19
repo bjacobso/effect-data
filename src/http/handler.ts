@@ -1,19 +1,33 @@
 import { Effect, Layer, Schema } from "effect";
 import { HttpApi, HttpApiGroup, HttpApiEndpoint, HttpApiBuilder, HttpApiSchema } from "effect/http-api";
-import { Engine, type EngineValue } from "../core/engine.ts";
+import { Engine, type ApplyMode, type EngineValue } from "../core/engine.ts";
 import { type Registry, issue } from "../core/model.ts";
 import { realDate } from "../core/values.ts";
 import { Store } from "../storage/Store.ts";
 import { ensure, Invalid, NotFound } from "../Errors.ts";
 import { AccountMiddleware, ValidationMiddleware, AccountLive, ValidationLive, Tenant, respond, entityId, errors } from "./boundary.ts";
-import { EntitySchema, MutatedEntity, createSchema, patchSchema, params, scalar, PlanSchema } from "./schemas.ts";
+import {
+  EntitySchema,
+  MutatedEntity,
+  createSchema,
+  patchSchema,
+  params,
+  scalar,
+  PlanSchema,
+  RolloutSchema,
+  ViolationStatus,
+  ViolationPage,
+} from "./schemas.ts";
 export function coreApi(engine: EngineValue) {
   const registry = Schema.Struct({ ...engine.fields, version: Schema.Int });
   return HttpApi.make("data")
     .add(
       HttpApiGroup.make("core")
         .add(
-          HttpApiEndpoint.get("registry", "/v2/registry", { success: registry, error: errors }),
+          HttpApiEndpoint.get("registry", "/v2/registry", {
+            success: Schema.Struct({ ...registry.fields, rollout: RolloutSchema }),
+            error: errors,
+          }),
           HttpApiEndpoint.post("plan", "/v2/registry/plan", { payload: engine.payload(), success: PlanSchema, error: errors }),
           HttpApiEndpoint.put("apply", "/v2/registry", { payload: engine.payload(true), success: registry, error: errors }),
           HttpApiEndpoint.get("jsonSchema", "/v2/registry/json-schema/:shape", {
@@ -34,6 +48,19 @@ export function coreApi(engine: EngineValue) {
             error: errors,
           }),
           HttpApiEndpoint.delete("remove", "/v2/entities/:id", { params, success: HttpApiSchema.NoContent, error: errors }),
+          HttpApiEndpoint.get("referrers", "/v2/entities/:id/referrers", {
+            params,
+            success: Schema.Struct({
+              data: Schema.Array(
+                Schema.Struct({
+                  entity_id: Schema.String,
+                  attribute: Schema.String,
+                  on_delete: Schema.Literals(["block", "clear"]),
+                }),
+              ),
+            }),
+            error: errors,
+          }),
           HttpApiEndpoint.get("history", "/v2/entities/:id/history", {
             params,
             success: Schema.Struct({
@@ -44,11 +71,21 @@ export function coreApi(engine: EngineValue) {
                   attribute: Schema.String,
                   op: Schema.String,
                   value: scalar,
-                  reason: Schema.String,
+                  reason: Schema.Literals(["api", "automation", "migration", "reference"]),
                   actor: Schema.String,
                 }),
               ),
             }),
+            error: errors,
+          }),
+          HttpApiEndpoint.get("violations", "/v2/violations", {
+            query: {
+              after: Schema.optionalKey(Schema.String),
+              limit: Schema.optionalKey(Schema.String),
+              status: Schema.optionalKey(ViolationStatus),
+              attribute: Schema.optionalKey(Schema.String),
+            },
+            success: ViolationPage,
             error: errors,
           }),
           HttpApiEndpoint.get("outbox", "/v2/outbox", {
@@ -86,8 +123,8 @@ export const CoreHttpLive = Layer.unwrap(
         const registryInput = (payload: unknown) =>
           Effect.gen(function* () {
             yield* ensure(engine.structure(payload));
-            const { base_version, ...desired } = payload as Record<string, unknown>;
-            return { base: Number(base_version), desired: engine.normalize(desired as Registry) };
+            const { base_version, mode, ...desired } = payload as Record<string, unknown>;
+            return { base: Number(base_version), mode: mode as ApplyMode | undefined, desired: engine.normalize(desired as Registry) };
           });
         const onEntity = <A, E, R>(id: string, action: (id: string, account: string, actor: string) => Effect.Effect<A, E, R>) =>
           respond(
@@ -103,7 +140,7 @@ export const CoreHttpLive = Layer.unwrap(
                 const t = yield* Tenant,
                   s = store,
                   r = yield* s.getRegistry(t.account);
-                return { version: r.version, ...r.registry };
+                return { version: r.version, ...r.registry, rollout: yield* s.rolloutStatus(t.account, r.version) };
               }),
             ),
           plan: ({ payload }) =>
@@ -112,7 +149,7 @@ export const CoreHttpLive = Layer.unwrap(
                 const t = yield* Tenant,
                   s = store,
                   r = yield* registryInput(payload);
-                return yield* s.plan(t.account, r.desired);
+                return yield* s.plan(t.account, r.desired, r.mode);
               }),
             ),
           apply: ({ payload }) =>
@@ -121,7 +158,7 @@ export const CoreHttpLive = Layer.unwrap(
                 const t = yield* Tenant,
                   s = store,
                   r = yield* registryInput(payload);
-                return yield* s.apply(t.account, t.actor, r.desired, r.base);
+                return yield* s.apply(t.account, t.actor, r.desired, r.base, r.mode);
               }),
             ),
           jsonSchema: ({ params }) =>
@@ -169,25 +206,22 @@ export const CoreHttpLive = Layer.unwrap(
               }),
             ),
           remove: ({ params }) => onEntity(params.id, (id, account, actor) => store.remove(account, actor, id)),
+          referrers: ({ params }) => onEntity(params.id, (id, account) => store.referrers(account, id)),
           history: ({ params }) => onEntity(params.id, (id, account) => store.history(account, id)),
           outbox: ({ query }) =>
             respond(
               Effect.gen(function* () {
                 const t = yield* Tenant,
-                  s = store;
-                const read = (field: "after" | "limit", fallback: number, min: number, max: number) => {
-                  const v = query[field];
-                  return v === undefined
-                    ? fallback
-                    : /^\d+$/.test(v) && Number.isSafeInteger(+v) && +v >= min && +v <= max
-                      ? +v
-                      : undefined;
-                };
-                const after = read("after", 0, 0, Number.MAX_SAFE_INTEGER),
-                  limit = read("limit", 50, 1, 200);
-                if (after === undefined || limit === undefined)
-                  return yield* Effect.fail(new Invalid({ issues: [issue(after === undefined ? "after" : "limit")] }));
-                return yield* s.outbox(t.account, after, limit);
+                  { after, limit } = yield* pagination(query);
+                return yield* store.outbox(t.account, after, limit);
+              }),
+            ),
+          violations: ({ query }) =>
+            respond(
+              Effect.gen(function* () {
+                const t = yield* Tenant,
+                  { after, limit } = yield* pagination(query);
+                return yield* store.listViolations(t.account, query.status, query.attribute, after, limit);
               }),
             ),
         });
@@ -195,3 +229,20 @@ export const CoreHttpLive = Layer.unwrap(
     );
   }),
 );
+
+const pagination = (query: { after?: string; limit?: string }) =>
+  Effect.gen(function* () {
+    const read = (field: "after" | "limit", fallback: number, min: number, max: number) => {
+      const value = query[field];
+      return value === undefined
+        ? fallback
+        : /^\d+$/.test(value) && Number.isSafeInteger(+value) && +value >= min && +value <= max
+          ? +value
+          : undefined;
+    };
+    const after = read("after", 0, 0, Number.MAX_SAFE_INTEGER),
+      limit = read("limit", 50, 1, 200);
+    if (after === undefined || limit === undefined)
+      return yield* Effect.fail(new Invalid({ issues: [issue(after === undefined ? "after" : "limit")] }));
+    return { after, limit };
+  });

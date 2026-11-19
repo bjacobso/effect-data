@@ -24,7 +24,7 @@ Create `onb_data` and `onb_data_test` once with `createdb`, then:
 make deps migrate test
 make run
 # In another terminal:
-BASE_URL=http://localhost:8086 node conformance/data.mjs
+BASE_URL=http://localhost:8086 node conformance/data.ts
 ```
 
 `PORT` defaults to 8086. `DATABASE_URL` defaults to
@@ -38,6 +38,7 @@ OpenAPI document at `/v2/openapi.json` are public.
 `X-Actor` is optional. The contract is in [PLAN.md](PLAN.md); implementation
 results, LOC accounting, schema experience, and limitations are in
 [REPORT.md](REPORT.md).
+The current contract, kept in step with the code, is [SPEC.md](SPEC.md).
 
 `src/core/` contains pure primitives and no HTTP, SQL, or domain vocabulary.
 `src/packs/` supplies typed kinds, operations, and HttpApi groups.
@@ -63,5 +64,30 @@ and `POST /v2/entities/{id}/certifications` with `{ "on": "YYYY-MM-DD" }`.
 With the default packs running, also verify:
 
 ```sh
-BASE_URL=http://localhost:8086 node conformance/data-certs.mjs
+BASE_URL=http://localhost:8086 node conformance/data-certs.ts
 ```
+
+Ref attributes store an entity ID from the same account and declare a target
+shape. Deletion blocks by default. An optional `on_delete: "clear"`
+retracts the incoming fact and records it in history with reason
+`reference`. Preview the live incoming edges at
+`GET /v2/entities/{id}/referrers`.
+
+```sh
+BASE_URL=http://localhost:8086 node conformance/data-refs.ts
+```
+
+The benchmark invokes the Store directly. Create the dedicated
+`onb_data_bench` database once and run the Pass 6 rollout workload.
+
+```sh
+createdb -h localhost onb_data_bench
+make bench
+```
+
+Use `BENCH_DATABASE_URL` to override the connection URL. Each run recreates
+its own benchmark schema in that database and writes
+`bench/results-pass6-current.json`. `BENCH_ENTITIES` overrides the
+one-million-entity default for a smoke run, which writes a separate result.
+Historical benchmark results and their workloads are documented in
+[REPORT.md](REPORT.md).

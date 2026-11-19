@@ -2,7 +2,16 @@ import { Schema, SchemaIssue } from "effect";
 export type Value = string | number | boolean;
 export type Facts = Record<string, Value>;
 export type Doc = Record<string, unknown>;
-export type Attribute = { key: string; type: string; values?: readonly string[]; label?: string; unique?: boolean };
+export type EdgePolicy = "block" | "clear";
+export type Edge = { target: string; on_delete: EdgePolicy };
+export type Attribute = Partial<Edge> & {
+  key: string;
+  type: string;
+  values?: readonly string[];
+  label?: string;
+  unique?: boolean;
+  retired?: true;
+};
 export type Shape = { key: string; attributes: readonly string[]; required?: readonly string[] };
 export type Condition = { fact: string; operator: string; value?: Value | Value[]; ignore_case?: boolean };
 export type Rule = boolean | { all: Rule[] } | { any: Rule[] } | { not: Rule } | Condition;

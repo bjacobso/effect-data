@@ -4,6 +4,7 @@ import { Schema, Arbitrary, Effect } from "effect";
 import { readdirSync, readFileSync } from "node:fs";
 import { compose } from "../src/composition.ts";
 import { engine } from "../src/core/engine.ts";
+import { registryImpact } from "../src/core/registryImpact.ts";
 import { collect } from "../src/core/registry.ts";
 import { defineKind, defineOp } from "../src/core/model.ts";
 import { policyKind, ops } from "../src/packs/onboarding/documents.ts";
@@ -24,6 +25,89 @@ const entity = (facts: Entity["facts"]): Entity => ({
 });
 
 describe("registry pipeline", () => {
+  test("classified plans agree with full revalidation across registry pairs and valid live projections", () => {
+    const id = (n: number) => `en_${String(n).padStart(21, "0")}`;
+    fc.assert(
+      fc.property(
+        fc.record({
+          startedUnique: fc.boolean(),
+          makeUnique: fc.boolean(),
+          required: fc.boolean(),
+          keepMember: fc.boolean(),
+          removeTarget: fc.boolean(),
+          refType: fc.constantFrom("leave", "retarget", "string", "clear"),
+          valueType: fc.constantFrom("string", "integer", "enum"),
+          enumValues: fc.subarray(["a", "b", "\u0000", "\ud800"], { minLength: 1 }),
+          addPolicy: fc.boolean(),
+          rows: fc.array(fc.record({ value: fc.option(fc.constantFrom("a", "b", "\u0000", "\ud800")), linked: fc.boolean() })),
+        }),
+        (sample) => {
+          const current: Registry = {
+            attributes: [
+              { key: "data/value", type: "string", unique: sample.startedUnique },
+              { key: "data/link", type: "ref", target: "target" },
+              { key: "data/name", type: "string" },
+            ],
+            shapes: [
+              { key: "source", attributes: ["data/value", "data/link"] },
+              { key: "target", attributes: ["data/name"] },
+              { key: "other", attributes: ["data/name", "data/value"] },
+            ],
+            automations: [],
+          };
+          const live = [
+            { ...entity({}), shape: "target", id: id(0) },
+            ...sample.rows.map(({ value, linked }, i) => ({
+              ...entity({
+                ...(value === null ? {} : { "data/value": sample.startedUnique ? value + i : value }),
+                ...(linked && i % 2 === 0 ? { "data/link": id(0) } : {}),
+              }),
+              shape: i % 2 === 0 ? "source" : "other",
+              id: id(i + 1),
+            })),
+          ].reverse();
+          const link = current.attributes[1]!;
+          const desired: Registry = {
+            ...current,
+            attributes: [
+              {
+                key: "data/value",
+                type: sample.valueType,
+                unique: sample.makeUnique,
+                ...(sample.valueType === "enum" ? { values: sample.enumValues } : {}),
+                label: "Value",
+              },
+              sample.refType === "string"
+                ? { key: link.key, type: "string" }
+                : sample.refType === "retarget"
+                  ? { ...link, target: "other" }
+                  : sample.refType === "clear"
+                    ? { ...link, on_delete: "clear" }
+                    : link,
+              current.attributes[2]!,
+              { key: "data/extra", type: "boolean" },
+            ],
+            shapes: [
+              {
+                key: "source",
+                attributes: ["data/link", "data/extra", ...(sample.keepMember ? ["data/value"] : [])],
+                required: sample.required && sample.keepMember ? ["data/value"] : [],
+              },
+              ...current.shapes.slice(sample.removeTarget ? 2 : 1),
+            ],
+            policies: sample.addPolicy ? [{ id: "extra", shape: "source", applies_when: true, requires: [{ form: "test" }] }] : [],
+          };
+          expect(app.plan(current, current, live).violations).toEqual([]);
+          const impact = registryImpact(current, desired);
+          const candidates = live.filter((e) => impact.shapes.has(e.shape));
+          const targets = new Map(live.filter((e) => impact.targets.has(e.shape)).map((e) => [e.id, e.shape]));
+          expect(app.plan(current, desired, candidates, 1, undefined, { impact, targets })).toEqual(app.plan(current, desired, live, 1));
+        },
+      ),
+      { numRuns: 400 },
+    );
+  });
+
   test("fixture checks, compiles real schemas, plans canonical differences", () => {
     const r = fixture(),
       c = app.compile(r);
@@ -49,7 +133,6 @@ describe("registry pipeline", () => {
       desired = fixture();
     desired.automations = [];
     desired.policies = [];
-    desired.attributes = desired.attributes!.filter((a) => a.key !== "employee/state");
     desired.shapes![0]!.attributes = desired.shapes![0]!.attributes.filter((k: string) => k !== "employee/state");
     expect(app.plan(r, desired, [entity({ "person/email": "a", "employee/state": "CA" })]).applicable).toBe(true);
     desired.attributes![0]!.type = "integer";
@@ -118,6 +201,70 @@ describe("registry pipeline", () => {
     expect(evaluator(date)({ "employee/start": "2026-01-01" })).toBe("T");
     expect(evaluator(date)({})).toBe("U");
   });
+  test("ref declarations require a target and reject target metadata on other types", () => {
+    const r = app.empty();
+    r.attributes = [
+      { key: "x/missing", type: "ref" },
+      { key: "x/scalar", type: "string", target: "s", on_delete: "block" },
+    ];
+    expect(app.structure(r).map((x) => x.field)).toEqual(["attributes[0].target", "attributes[1].target", "attributes[1].on_delete"]);
+    r.attributes = [{ key: "x/link", type: "ref", target: "missing", on_delete: "clear" }];
+    r.shapes = [{ key: "s", attributes: ["x/link"], required: ["x/link"] }];
+    expect(app.check(r)).toEqual([
+      { field: "attributes[0].target", issue: "Unknown shape" },
+      { field: "shapes[0].required[0]", issue: "Required ref cannot be cleared" },
+    ]);
+    r.attributes[0] = { key: "x/link", type: "ref", target: "s" };
+    expect(app.check(r)).toEqual([]);
+    expect(app.compile(r).edges.get("x/link")).toEqual({ target: "s", on_delete: "block" });
+    expect(r.attributes[0]).not.toHaveProperty("on_delete");
+    const doc = Schema.toJsonSchemaDocument(app.compile(r).schemas.get("s")!);
+    expect(doc.schema).toMatchObject({ properties: { "x/link": { pattern: "^en_[A-Za-z0-9_-]{21}$" } } });
+  });
+  test("ref rules support exact id comparisons and presence without consulting live data", () => {
+    const r = fixture();
+    const e = entity({});
+    r.attributes.push({ key: "employee/link", type: "ref", target: "employee" });
+    r.shapes[0]!.attributes = [...r.shapes[0]!.attributes, "employee/link"];
+    for (const [operator, value] of [
+      ["equal", e.id],
+      ["notEqual", e.id],
+      ["in", [e.id]],
+      ["notIn", [e.id]],
+      ["exists", undefined],
+      ["doesNotExist", undefined],
+    ] as const) {
+      r.policies![0]!.applies_when = { fact: "employee/link", operator, ...(value === undefined ? {} : { value }) };
+      expect(app.check(r)).toEqual([]);
+    }
+    for (const [condition, field] of [
+      [{ operator: "contains", value: e.id }, "operator"],
+      [{ operator: "lessThan", value: e.id }, "operator"],
+      [{ operator: "equal", value: e.id, ignore_case: false }, "ignore_case"],
+      [{ operator: "in", value: [e.id, "not an id"] }, "value"],
+    ] as const) {
+      r.policies![0]!.applies_when = { fact: "employee/link", ...condition };
+      expect(app.check(r).map((x) => x.field)).toEqual([`policies[0].applies_when.${field}`]);
+    }
+  });
+  test("removing a target shape reports both the registry issue and dangling retained facts", () => {
+    const r: Registry = {
+      attributes: [
+        { key: "x/name", type: "string" },
+        { key: "x/link", type: "ref", target: "target" },
+      ],
+      shapes: [
+        { key: "employee", attributes: ["x/link"] },
+        { key: "target", attributes: ["x/name"] },
+      ],
+      automations: [],
+    };
+    const target = { ...entity({}), id: "en_BBBBBBBBBBBBBBBBBBBBB", shape: "target" };
+    const source = entity({ "x/link": target.id });
+    const plan = app.plan(r, { ...r, shapes: r.shapes.slice(0, 1) }, [source, target]);
+    expect(plan.issues.map((x) => x.field)).toEqual(["attributes[1].target"]);
+    expect(plan.violations).toEqual([{ entity_id: source.id, field: "facts.x/link", issue: "Dangling reference", blocking: true }]);
+  });
   test("unresolved refs suppress dependent checks; issues preserve field order", () => {
     const r = fixture();
     r.automations![0]!.when = { fact: "x/missing", operator: "lessThan", value: true, ignore_case: true };
@@ -140,13 +287,22 @@ describe("registry pipeline", () => {
 
 test("generated reference completeness has an independent enumeration oracle", () => {
   fc.assert(
-    fc.property(fc.integer({ min: 1, max: 12 }), fc.nat(), (n, pick) => {
+    fc.property(fc.integer({ min: 1, max: 12 }), fc.nat(), fc.array(fc.boolean(), { minLength: 12, maxLength: 12 }), (n, pick, flags) => {
       const keys = Array.from({ length: n }, (_, i) => `x/a${i}`),
         lost = pick % n;
       const condition = (key: string) => ({ fact: key, operator: "exists" });
+      const isRef = (i: number) => i === 0 || flags[i];
+      const target = (i: number) => (i % 2 ? "odd" : "even");
       const r: Registry = {
-        attributes: keys.map((key) => ({ key, type: "string" })),
-        shapes: [{ key: "s", attributes: keys }],
+        attributes: [
+          ...keys.map((key, i) => (isRef(i) ? { key, type: "ref", target: target(i) } : { key, type: "string" })),
+          { key: "x/anchor", type: "string" },
+        ],
+        shapes: [
+          { key: "s", attributes: keys },
+          { key: "even", attributes: ["x/anchor"] },
+          { key: "odd", attributes: ["x/anchor"] },
+        ],
         policies: keys.map((key, i) => ({
           id: `p${i}`,
           name: "P",
@@ -159,11 +315,16 @@ test("generated reference completeness has an independent enumeration oracle", (
           shape: "s",
           on: { changed: [key] },
           when: condition(key),
-          do: [{ op: "set", attribute: key, value: "v" }],
+          do: [{ op: "set", attribute: key, value: isRef(i) ? entity({}).id : "v" }],
         })),
       };
       expect(app.structure(r)).toEqual([]);
       expect(app.check(r)).toEqual([]);
+      const removedShape = target(pick);
+      const without = { ...r, shapes: r.shapes.filter((s) => s.key !== removedShape) };
+      expect(app.check(without).map((x) => x.field)).toEqual(
+        keys.flatMap((_, i) => (isRef(i) && target(i) === removedShape ? [`attributes[${i}].target`] : [])),
+      );
       r.attributes!.splice(lost, 1);
       const expected = [
         `shapes[0].attributes[${lost}]`,

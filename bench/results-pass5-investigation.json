@@ -1,0 +1,453 @@
+{
+  "mode": "pass5",
+  "measured_at": "2026-11-19T14:40:31.434Z",
+  "driver": "Store",
+  "database": "onb_data_bench",
+  "environment": {
+    "node": "v26.13.0",
+    "postgres": "17.11 (Homebrew)",
+    "cpu": "Apple M2 Max",
+    "memory_bytes": 34359738368
+  },
+  "fixture": {
+    "large_account": "bench_big",
+    "large_entities": 1000000,
+    "small_accounts": 100,
+    "entities_per_small_account": 32,
+    "attributes": 200,
+    "initial_shape_attributes": 199,
+    "initial_facts_per_entity": 7,
+    "workers": 16,
+    "writes_per_worker": 250
+  },
+  "patch": {
+    "single": {
+      "writes": 250,
+      "wall_ms": 319.1499999999942,
+      "writes_per_second": 783.3307222309402,
+      "p50_ms": 1.1394160000199918,
+      "p95_ms": 2.0675000000046566,
+      "p99_ms": 3.2777920000080485,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.09288864799914881,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.06114249600004405,
+          "statements": 1.0000000000000007
+        },
+        "entity read": {
+          "ms": 0.09645434399996883,
+          "statements": 1.0000000000000007
+        },
+        "registry read": {
+          "ms": 0.1286716639996739,
+          "statements": 1.0000000000000007
+        },
+        "decode": {
+          "ms": 0.04102816799969878,
+          "statements": 0
+        },
+        "ref validation": {
+          "ms": 0.09327599200094121,
+          "statements": 1.0000000000000007
+        },
+        "staging": {
+          "ms": 0.006486527999863025,
+          "statements": 0
+        },
+        "uniqueness": {
+          "ms": 0.0799133200002834,
+          "statements": 1.0000000000000007
+        },
+        "edge update": {
+          "ms": 0.1022046399994288,
+          "statements": 1.0000000000000007
+        },
+        "staging and automations": {
+          "ms": 0.007213524000486361,
+          "statements": 0
+        },
+        "clock reserve": {
+          "ms": 0.08107049199834002,
+          "statements": 1.0000000000000007
+        },
+        "flush inserts and assembly": {
+          "ms": 0.2906388360012786,
+          "statements": 3.000000000000002
+        },
+        "transaction completion": {
+          "ms": 0.17966001600050358,
+          "statements": 0
+        }
+      }
+    },
+    "busy": {
+      "writes": 4000,
+      "wall_ms": 2445.2229579999985,
+      "writes_per_second": 1635.8426485868135,
+      "p50_ms": 7.272333000000799,
+      "p95_ms": 26.59579200000735,
+      "p99_ms": 42.586999999999534,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.09071109649974829,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.06336351750005276,
+          "statements": 0.9999999999999176
+        },
+        "entity read": {
+          "ms": 0.07992395125022425,
+          "statements": 0.9999999999999176
+        },
+        "registry read": {
+          "ms": 0.11703105499987591,
+          "statements": 0.9999999999999176
+        },
+        "decode": {
+          "ms": 0.028595962500206937,
+          "statements": 0
+        },
+        "ref validation": {
+          "ms": 0.09988651424995619,
+          "statements": 0.9999999999999176
+        },
+        "staging": {
+          "ms": 0.004569170249829768,
+          "statements": 0
+        },
+        "uniqueness": {
+          "ms": 0.07939843099989224,
+          "statements": 0.9999999999999176
+        },
+        "edge update": {
+          "ms": 0.12810062999985541,
+          "statements": 0.9999999999999176
+        },
+        "staging and automations": {
+          "ms": 0.004863078000104001,
+          "statements": 0
+        },
+        "clock reserve": {
+          "ms": 8.206594679000409,
+          "statements": 0.9999999999999176
+        },
+        "flush inserts and assembly": {
+          "ms": 0.33329494449988784,
+          "statements": 3.0000000000000857
+        },
+        "transaction completion": {
+          "ms": 0.23673159374978414,
+          "statements": 0
+        }
+      }
+    },
+    "spread": {
+      "writes": 4000,
+      "wall_ms": 1552.087542000023,
+      "writes_per_second": 2577.1742197257718,
+      "p50_ms": 5.513082999998005,
+      "p95_ms": 9.763542000000598,
+      "p99_ms": 11.41883300000336,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.5067466905000032,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.4804435739998212,
+          "statements": 0.9999999999999176
+        },
+        "entity read": {
+          "ms": 0.5070933527502058,
+          "statements": 0.9999999999999176
+        },
+        "registry read": {
+          "ms": 0.5381876422503129,
+          "statements": 0.9999999999999176
+        },
+        "decode": {
+          "ms": 0.038332806749866104,
+          "statements": 0
+        },
+        "ref validation": {
+          "ms": 0.5065358989997905,
+          "statements": 0.9999999999999176
+        },
+        "staging": {
+          "ms": 0.0034812437501677744,
+          "statements": 0
+        },
+        "uniqueness": {
+          "ms": 0.4697084744997998,
+          "statements": 0.9999999999999176
+        },
+        "edge update": {
+          "ms": 0.4863482354999869,
+          "statements": 0.9999999999999176
+        },
+        "staging and automations": {
+          "ms": 0.00409091274995444,
+          "statements": 0
+        },
+        "clock reserve": {
+          "ms": 0.482141823750288,
+          "statements": 0.9999999999999176
+        },
+        "flush inserts and assembly": {
+          "ms": 1.4495658257499726,
+          "statements": 3.0000000000000857
+        },
+        "transaction completion": {
+          "ms": 0.6532795665000682,
+          "statements": 0
+        }
+      }
+    }
+  },
+  "apply": {
+    "attach_optional": {
+      "wall_ms": 83720.714,
+      "exclusive_lock_ms": 83720.185666,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.2760839999828022,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.2522500000195578,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 0.9748329999856651,
+          "statements": 1
+        },
+        "load and parse": {
+          "ms": 1575.751500000013,
+          "statements": 1
+        },
+        "registry checks and diff": {
+          "ms": 2.231999999989057,
+          "statements": 0
+        },
+        "entity revalidation": {
+          "ms": 20185.055167000013,
+          "statements": 0
+        },
+        "apply overhead": {
+          "ms": 0.33795799998915754,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 61946.674583000015,
+          "statements": 1000000
+        },
+        "registry write": {
+          "ms": 7.941333999973722,
+          "statements": 1
+        },
+        "transaction completion": {
+          "ms": 1.218291000026511,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 83750.67091700001,
+        "p95_ms": 83757.434125,
+        "p99_ms": 83757.434125
+      },
+      "max_rss_kib": 1177520,
+      "rss_after_load_bytes": 1098399744,
+      "lock_granted_monotonic_ms": 167111.6025,
+      "start_monotonic_ms": 167111.074166,
+      "end_monotonic_ms": 250831.788166
+    },
+    "make_unique": {
+      "failure": "out of shared memory (PostgreSQL advisory lock table), rolled back",
+      "wall_ms": 28129.784124999976,
+      "exclusive_lock_ms": 28128.631832999992,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.765291999996407,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.3869999999878928,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 2.781916000007186,
+          "statements": 1
+        },
+        "load and parse": {
+          "ms": 1574.7288340000086,
+          "statements": 1
+        },
+        "registry checks and diff": {
+          "ms": 2.5281249999825377,
+          "statements": 0
+        },
+        "entity revalidation": {
+          "ms": 21182.785125000024,
+          "statements": 0
+        },
+        "apply overhead": {
+          "ms": 0.13016599998809397,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 5365.677666999982,
+          "statements": 75153
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 28135.15170899997,
+        "p95_ms": 28141.12529200001,
+        "p99_ms": 28141.12529200001
+      },
+      "max_rss_kib": 2318352,
+      "rss_after_load_bytes": 1272905728,
+      "lock_granted_monotonic_ms": 250875.734,
+      "start_monotonic_ms": 250874.581708,
+      "end_monotonic_ms": 279004.365833
+    },
+    "remove_populated": {
+      "wall_ms": 35890288.205875,
+      "exclusive_lock_ms": 35890287.8965,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.15916600002674386,
+          "statements": 0
+        },
+        "account lock": {
+          "ms": 0.15020899998489767,
+          "statements": 1
+        },
+        "registry read": {
+          "ms": 0.5303749999729916,
+          "statements": 1
+        },
+        "load and parse": {
+          "ms": 1343.570250000048,
+          "statements": 1
+        },
+        "registry checks and diff": {
+          "ms": 1.6667079999460839,
+          "statements": 0
+        },
+        "entity revalidation": {
+          "ms": 19671.44429200003,
+          "statements": 0
+        },
+        "apply overhead": {
+          "ms": 0.03741599997738376,
+          "statements": 0
+        },
+        "staging, uniqueness and edges": {
+          "ms": 117352.17087500001,
+          "statements": 2000000
+        },
+        "registry write": {
+          "ms": 1.1457919999957085,
+          "statements": 1
+        },
+        "clock reserve": {
+          "ms": 0.7779999999911524,
+          "statements": 1
+        },
+        "flush inserts and assembly": {
+          "ms": 35751911.700375006,
+          "statements": 338
+        },
+        "transaction completion": {
+          "ms": 4.852416999638081,
+          "statements": 0
+        }
+      },
+      "patch_during_apply": {
+        "samples": 16,
+        "p50_ms": 35890369.2895,
+        "p95_ms": 35890380.282166995,
+        "p99_ms": 35890380.282166995
+      },
+      "max_rss_kib": 2790368,
+      "rss_after_load_bytes": 1279459328,
+      "lock_granted_monotonic_ms": 279021.645625,
+      "start_monotonic_ms": 279021.33625,
+      "end_monotonic_ms": 36169309.542125
+    }
+  },
+  "as_of": [
+    {
+      "history_rows": 10,
+      "samples": 30,
+      "p50_ms": 0.20616700500249863,
+      "p95_ms": 0.4044580012559891,
+      "p99_ms": 0.592167004942894,
+      "sql_rows": 14,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.002194434156020482,
+          "statements": 0
+        },
+        "as_of SQL": {
+          "ms": 0.24274166623751323,
+          "statements": 1.9999999999999998
+        },
+        "as_of replay": {
+          "ms": 0.003197300185759863,
+          "statements": 0
+        }
+      }
+    },
+    {
+      "history_rows": 1000,
+      "samples": 30,
+      "p50_ms": 1.9564170017838478,
+      "p95_ms": 3.141125001013279,
+      "p99_ms": 5.168749995529652,
+      "sql_rows": 1994,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.002564000089963277,
+          "statements": 0
+        },
+        "as_of SQL": {
+          "ms": 2.0677652661999066,
+          "statements": 1.9999999999999998
+        },
+        "as_of replay": {
+          "ms": 0.09867780059576034,
+          "statements": 0
+        }
+      }
+    },
+    {
+      "history_rows": 10000,
+      "samples": 30,
+      "p50_ms": 12.728749997913837,
+      "p95_ms": 13.601667001843452,
+      "p99_ms": 13.791209004819393,
+      "sql_rows": 19994,
+      "phases": {
+        "transaction startup": {
+          "ms": 0.0041194329659144085,
+          "statements": 0
+        },
+        "as_of SQL": {
+          "ms": 12.15141943345467,
+          "statements": 1.9999999999999998
+        },
+        "as_of replay": {
+          "ms": 0.6476236330966155,
+          "statements": 0
+        }
+      }
+    }
+  ]
+}

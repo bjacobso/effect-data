@@ -1,7 +1,7 @@
 # effect-data: Clojure's philosophy, Effect-native (minimal POC)
 
 > This is the working plan given to a coding agent, kept as written across
-> three passes. References to `../PLAN.md` and `../effect-ts` point into the
+> several passes. References to `../PLAN.md` and `../effect-ts` point into the
 > exploration this started in; the parts that matter are restated in
 > [docs/inherited-contract.md](docs/inherited-contract.md).
 
@@ -47,6 +47,8 @@ queries later (as two more document kinds).
 - Hand-written SQL. No ORM.
 - If anything here is ambiguous or contradicts `conformance/data.mjs`, stop
   and write `QUESTIONS.md`. Never bend code to fit a test you believe is wrong.
+- **Keep SPEC.md current:** it is the system's contract as implemented.
+  Every behaviour change updates it in the same commit (see AGENTS.md).
 - **Line budget:** aim for at most **1,200 non-test lines** in `src/`. Report
   honestly if you exceed it and why.
 
@@ -460,3 +462,569 @@ Lines in the certification pack; every file touched outside it and why; the
 primitives (anything a third pack would want in core — e.g. date math,
 per-pack routes needing request bodies); results of `data.mjs` under both
 `PACKS` settings and `data-certs.mjs`.
+
+## Pass 4: housekeeping, a baseline benchmark, and refs between entities
+
+Goal: test the claim that a new capability is a small, generic addition, using
+the hardest case so far. Every earlier kind was configuration beside the data;
+a ref changes the data itself (integrity on write, behavior on delete, impact
+that follows edges). Refs are honestly a **core primitive** (a new attribute
+type), not a pack, so this pass has an explicit core-change budget and the
+report measures against it. Keep every existing test and both conformance
+suites green.
+
+### 0. Housekeeping (land first, in its own commit)
+
+- Convert `conformance/data.mjs` and `conformance/data-certs.mjs` to
+  TypeScript programs that are **Effect end to end**: `HttpClient` for
+  requests, `Schema` to decode every response body, typed errors for failed
+  expectations, `Effect.gen` for each case, `NodeRuntime.runMain` as the
+  entry point, run with `node`. Same cases, same assertions, same `BASE_URL`
+  contract.
+- Write them as an **external user of the API would, from first
+  principles**: they import nothing from `src/` (still black-box) and define
+  their own response schemas from the wire contract in this plan. They double
+  as the example of how to consume this service with Effect, so favour
+  readable, idiomatic code over clever helpers: a reader new to the
+  repo should learn the API from them.
+- `LICENSE` is MIT (already added).
+- Update the README commands accordingly.
+
+### 1. Baseline benchmark (before any refs code)
+
+`bench/` holds a script that generates one account (`bench_big`) with
+**200 attributes** in the registry, **199 of them** in one shape, mixed
+types, and **1,000,000 entities**, plus 100 small accounts. One of the 199
+is a `string` attribute `bench/link` holding the id of another entity (see
+the matched workload below). It measures and writes
+`bench/results-baseline.json`:
+
+- write throughput: N concurrent PATCH workers on one busy account vs the
+  same N spread over the 100 accounts (p50/p95/p99, writes/s);
+- registry apply on `bench_big` that attaches the 200th attribute to the
+  shape as **optional** (no retractions, but every live entity is
+  revalidated): wall time and how long the exclusive account lock is held;
+- `as_of` latency for entities with 10, 1,000 and 10,000 history rows.
+
+The PATCH workload sets `bench/link` to the id of another live entity.
+In the refs run, `bench/link` is declared as
+`{type: "ref", target: <the shape>}` instead of `string`; everything else,
+including the payloads and entity ids patched, is identical. That isolates
+the cost of ref validation and edge maintenance.
+
+Drive the Store directly or over HTTP (say which). It does not need to be
+fast to generate; it must be repeatable (`make bench`). Rerun the same script
+at the end of Pass 4 into `bench/results-refs.json`, so the write-path cost
+of refs is a measured before/after, not a guess.
+
+### 2. The ref attribute type
+
+```json
+{ "key": "employee/manager", "type": "ref", "target": "employee", "on_delete": "block" }
+```
+
+- `target` is a shape key and is a **reference** (`{path: "target", to:
+  "shape"}`) resolved by the existing reference checker. Unknown target → one
+  issue at `attributes[i].target`.
+- `on_delete` is `block | clear`; absent means `block` and is omitted on
+  output (no inserted defaults).
+- For `ref`, `target` is **required** and `on_delete` is **optional**. Both
+  are **forbidden** on every other type (checked in `structure`, like
+  `values`).
+- A `clear` ref that is in any shape's `required` list → one issue at
+  `shapes[i].required[j]` ("Required ref cannot be cleared").
+- Value encoding: an entity id string matching `^en_[A-Za-z0-9_-]{21}$`
+  (the existing id format). A self-reference is allowed.
+- `unique: true` on a ref is allowed (one-to-one) and uses the existing
+  mechanism unchanged.
+- Rules: conditions on a ref attribute allow only `equal`, `notEqual`, `in`,
+  `notIn`, `exists`, `doesNotExist`; operands must match the id pattern;
+  `ignore_case` is not allowed. No liveness check on operands. Paths through
+  refs (`employee/manager → person/email`) are **out of scope**.
+- `set` actions may set a ref; the value is checked like a PATCH.
+
+### 3. Integrity on write
+
+- On create, PATCH and automation `set`, every ref value must name a **live
+  entity whose shape is the attribute's `target`**, in the same account.
+  Otherwise 422 at `facts.<key>` with issue `"Unknown reference"` (an
+  automation `set` failing this fails the whole request with 422).
+- This must be race-free against a concurrent DELETE of the target: the writer
+  locks each referenced target row (e.g. `FOR KEY SHARE`) inside its
+  transaction; DELETE already locks the entity `FOR UPDATE`. Do not take an
+  exclusive account lock for either.
+- Maintain a live edge table `live_refs(account_id, entity_id, attribute,
+  target_id)` with an index on `(account_id, target_id)`, updated in the write
+  transaction exactly like `live_unique`. Edges are a projection; the facts log
+  stays the source of truth.
+
+### 4. Delete
+
+`DELETE /v2/entities/{id}`, in one database transaction:
+
+1. If any **other** live entity references it through a `block` ref →
+   409 `conflict`, `details` `[{field: "<referrer_id>.facts.<attribute>",
+   issue: "Referenced"}]` sorted by referrer id then attribute. Nothing is
+   written. Self-references never block.
+2. Otherwise delete it, then for each referrer through a `clear` ref (sorted by
+   referrer id), retract that fact in its own later `tx` with reason
+   **`reference`** and actor `reference:<deleted_id>`. This needs a migration
+   widening the `facts.reason` check; history must show these rows.
+3. Cascade retractions never trigger automations (same depth-1 rule as
+   automation `set`s) and never delete anything further. There is no
+   cascade-delete option.
+
+### 5. Impact
+
+- `GET /v2/entities/{id}/referrers` →
+  `{data: [{entity_id, attribute, on_delete}]}` for live referrers, sorted by
+  entity_id then attribute. 404 for an unknown or deleted entity. This is what
+  a client uses to preview a delete.
+- Registry plan/apply: every live ref value must still point at a live entity
+  of the desired `target` shape. Changing an attribute's `type` to `ref`,
+  changing `target`, or removing the target shape's entities' eligibility
+  yields violations at `facts.<key>` ("Dangling reference"). Retargeting is
+  allowed when no live value breaks.
+- `as_of` returns ref values as they were, even if the target has since been
+  deleted; history is not rewritten.
+
+### 6. Core-change budget (measured in REPORT.md)
+
+- Core may change only `model.ts`, `values.ts`, `kinds.ts`, `rules.ts` and
+  `engine.ts`. The literal `"ref"` may appear only in `values.ts`, `kinds.ts`
+  and `rules.ts`.
+- `compile` gains one generic output, `edges: Map<attribute, {target,
+  on_delete}>` (or equivalent), and storage consumes **only that**. Storage
+  must not inspect attribute types.
+- Target: **≤ 80 net lines in `src/core/`**. Exceeding it is allowed; report
+  exactly where and why. That is the result we want.
+- List every file touched outside `src/core/` and why, as in Pass 3.
+
+### 7. Tests and conformance
+
+- Unit: ref structure/reference issues (unknown target, `target` on a
+  non-ref, clear+required), rule operator checks for refs.
+- Property: extend property 2 (reference completeness) so generated
+  registries include ref attributes and deleting a shape predicts the
+  `target` issues exactly; extend property 3 (projection = fold(facts)) with
+  ref writes, blocked deletes and clear cascades, and add **edges =
+  fold(facts)**: `live_refs` always equals the edges recomputed from live
+  projections.
+- Concurrency: a create referencing X racing DELETE of X gives exactly one
+  of {201 then 409 on delete, 204 then 422 on create}, never a dangling edge
+  (repeat 50×).
+- New black-box suite `conformance/data-refs.ts`, in the same style as the converted suites, covering at least:
+  create with valid/unknown/wrong-shape/deleted target; PATCH to retarget and
+  to null; self-reference; block delete with ordered details; clear delete
+  with history rows and reason `reference`; clear does not fire automations;
+  referrers listing; `as_of` before and after a clear; registry plan
+  violations for retargeting; a `unique` ref; automation `set` of a bad ref
+  failing the request.
+
+### REPORT.md "Pass 4" section
+
+Housekeeping results; baseline vs refs benchmark numbers side by side; core
+lines changed against the budget, file by file; files touched outside core;
+where refs did **not** fit the kind/attribute protocol and what a generic
+primitive would have needed; results of all three conformance suites.
+
+## Pass 5: find and fix the slowness
+
+Goal: explain where time goes, then remove it. Pass 4 measured a registry
+apply on 1,000,000 entities holding the **exclusive account lock for ~80 s**
+(every write to that account blocks), plus PATCH at ~1,700-3,100 writes/s and
+`as_of` growing linearly with history. Measure first; change behaviour only in
+phase B. The wire contract does not change; SPEC.md is updated only where
+guarantees or known limits change.
+
+### Phase 0: bulk-insert bug fix (own commit, before phase A)
+
+`flush` inserts all events (and facts, projections, outbox rows) in one
+statement, so any write staging more rows than PostgreSQL's 65,535 bind
+parameters allow fails and rolls back: today a registry apply that retracts
+from more than ~7,281 entities cannot commit. Chunk every bulk insert in
+`flush` below the parameter limit, inside the same transaction. This restores
+the contract SPEC.md already states; it changes no semantics. Add a storage
+regression test whose apply retracts an attribute from more entities than one
+statement can hold (e.g. 10,000) and commits, with replay/as_of still
+matching. Record it in REPORT.md as a bug found by Pass 5.
+
+### Phase A: investigate (no behaviour changes, own commit)
+
+Instrument and record, in REPORT.md "Pass 5 investigation", for the
+`bench_big` account:
+
+1. **Registry apply**, split into phases with wall time and SQL statement
+   count each: waiting for the lock; loading and parsing live entities;
+   `plan` reference/type checks; per-entity revalidation (schema decode);
+   per-entity staging, uniqueness and edge work; registry write; flush. Add a
+   Node CPU profile (`--cpu-prof`) of the apply and name the top frames.
+2. **PATCH**: database round trips per write and time per step (account lock,
+   entity read, decode, uniqueness, refs, clock reserve, inserts), single and
+   under 16 workers.
+3. **as_of** at 10 / 1,000 / 10,000 history rows: rows read, time in SQL vs
+   replay.
+
+Confirm or refute these hypotheses from reading the code, with evidence:
+
+- **H1:** apply calls `unique()` for **every** live entity even when nothing
+  about it changed, which issues at least one `DELETE` round trip per entity
+  (1M statements) even with no unique attributes; changed entities pay it
+  twice (`stage` and the apply loop).
+- **H2:** `plan` decodes every live entity through Effect Schema in-process,
+  and that decode is a large CPU share.
+- **H3:** loading all live documents into memory is a material time and
+  memory cost (report peak RSS).
+- **H4:** all of the above runs inside the exclusive lock in one transaction,
+  so lock time is roughly total apply time.
+
+Add two apply scenarios to `make bench` alongside the existing one
+(attach an optional attribute): **remove a populated attribute** from the
+shape (1M migration retractions), and **make an attribute unique** whose
+values are already distinct. For every scenario also measure **PATCH p50/p99
+for writes to the same account issued while the apply runs**: that is the
+user-visible cost of the lock.
+
+### Phase B: fix, in this order, measuring after each step
+
+Rerun the bench after each step and record a row per step per scenario.
+
+1. **Skip no-op work.** An entity whose retained facts, unique slots and
+   edges do not change under the desired registry writes nothing: no
+   `live_unique` churn, no edge work, no event. Fix the double `unique()`.
+   Also drop the per-value advisory locks inside registry apply: the
+   exclusive account lock already excludes every writer, and holding one lock
+   per distinct value until commit exhausts PostgreSQL's shared lock memory
+   (make-unique failed at 30,000 entities in phase A). Phase A records that
+   failure as the make-unique baseline; do not raise PostgreSQL's lock limits
+   to work around it. Add a regression test that makes an attribute unique
+   across more entities than the default lock table holds and commits.
+2. **Classify changes before revalidating.** Compute from the registry diff
+   which entities can possibly violate the desired registry. Changes that
+   cannot (adding an attribute, adding an optional attribute to a shape,
+   labels, adding or editing policies, automations and other non-attribute
+   kinds) skip per-entity revalidation entirely. Revalidate only the shapes
+   and attributes affected by: new required members, type or `values`
+   changes, becoming unique, ref target or `on_delete` changes, attributes
+   leaving a shape, and removed shapes. Use indexed SQL where it is exact
+   (e.g. "any live entity lacks attribute X", "duplicate values of X") instead
+   of loading documents.
+   - **Differential property test (required):** for generated registry pairs
+     and live entities, the classified plan's `violations` equal the
+     full-revalidation plan's, always.
+3. **Shorten the lock for expensive changes.** When revalidation or
+   retractions are needed, do the scanning and validation in batches **before**
+   taking the exclusive lock, against a recorded tx position. Under the
+   exclusive lock, recheck only entities written after that position, then
+   write. If the retraction writes themselves still hold the lock for long,
+   report the number and stop there: fully online migration is a later pass.
+
+Targets (report against them; missing one is allowed with an explanation):
+attach-optional apply holds the exclusive lock **< 100 ms** at 1M entities;
+make-unique **< 5 s**; remove-populated reports its lock time honestly.
+
+### Phase C: PATCH and as_of (only if cheap)
+
+From phase A's numbers, fix the largest single PATCH cost if it does not
+change semantics (e.g. collapsing round trips). Do not change `as_of`
+storage in this pass; record the recommended change (checkpoints or an
+`(account, entity, tx)` latest-value read) with its expected effect.
+
+### Constraints for this pass
+
+- Plan/apply semantics, issues, violations and ordering are unchanged; every
+  existing test and conformance suite stays green.
+- Core changes are allowed in `plan` (classification is pure and belongs in
+  core); keep storage free of attribute-type knowledge, as in Pass 4.
+- Update SPEC.md section 9's known limits with the new measured numbers.
+
+### REPORT.md "Pass 5" section
+
+The investigation table and verdict on H1-H4; per-step before/after numbers
+for all three apply scenarios and the concurrent-PATCH impact; lines changed
+by layer; what remains slow and what the next change would be.
+
+## Pass 6: soft removal and background rollout
+
+Goal: no registry apply holds the exclusive account lock for longer than it
+takes to write the registry. Pass 5 left two slow applies at 1M entities:
+making an attribute unique (37 s lock) and removing a populated attribute
+(118 s lock). Both stay slow for as long as apply rewrites existing data
+inside one transaction, so this pass changes the contract instead:
+
+- **Removing an attribute is a soft delete.** Apply writes no facts. Reads
+  hide the values; they come back if the attribute is added back.
+- **Making an attribute unique rolls out in the background.** Apply returns at
+  once. New writes are enforced immediately; existing duplicates become
+  **violation records** that people can list, act on and fix.
+- Today's all-or-nothing behaviour stays available as `mode: "strict"`.
+
+This is a wire-contract change. SPEC.md changes in the same commits as the
+code (sections 2.2, 2.5, 4, 5, 6, 8, 9 and 11 at least). Branch:
+`pass-6-rollout`.
+
+### 0. Registry history (own commit, first)
+
+`registries` keeps only the current document. Add `registry_versions
+(account_id, version, document, at)` written on every apply in the same
+transaction, and backfill the current row for existing accounts. Needed for
+`as_of` in section 1. No behaviour change in this commit.
+
+### 1. Soft removal
+
+- **Visibility.** An entity's visible facts are the stored facts whose
+  attribute is in its shape under the registry being read against. Entity
+  reads, rules, automations, pack routes (`evaluate`, `certifications`),
+  `plan`, uniqueness and ref checks all use visible facts only.
+- **Apply writes no facts.** Removing an attribute from a shape, or retiring
+  it (below), only writes the registry. The stored projection keeps the hidden
+  values, so projection still equals replay of the log (keep the existing
+  property test green). New applies never write reason `migration`; the value
+  stays valid in old logs.
+- **Re-adding restores.** Putting the attribute back in the shape makes the
+  hidden values visible again, for every entity, without writes.
+- **Writes.** PATCH and create validate against visible facts. A hidden
+  attribute is not in the shape, so writing it is 422 as today. A write never
+  drops or changes hidden values.
+- **`as_of`** filters by the registry version in effect at that time (from
+  `registry_versions`). For a time before an account's earliest
+  `registry_versions` row (the section 0 backfill), return the unfiltered
+  replay, exactly as Pass 5 does: before this pass every removal retracted
+  facts physically, so there is nothing to hide. **History** is the log as written; a removal adds no
+  rows.
+- **Retirement.** Attribute gains `retired?: true`. Once an attribute has
+  been in an applied registry it can't be dropped from the document: omitting
+  it is a 422 issue at `attributes` ("Attribute cannot be removed; set
+  retired") naming the key. A retired attribute may not appear in any shape,
+  rule or action (normal reference checks report it). Its definition is
+  frozen while retired, and un-retiring (dropping `retired`) must keep the
+  definition unchanged in that same apply; it can change in a later apply.
+  This stops a key being reused with a different type over hidden values.
+- **Refs of hidden facts.** `live_refs` stays a projection of the **stored**
+  ref facts, hidden or not: soft removal never deletes its rows and re-adding
+  never has to restore them. Every read of it (delete blocking, `clear`,
+  `/referrers`) filters by the compiled registry's edges, so a hidden ref
+  never blocks a delete, is never cleared and is not listed, and a re-added
+  ref's `block`/`clear` takes effect the moment the apply commits. Precisely,
+  `live_refs` holds the stored facts (hidden or visible) of attributes whose
+  **current** type is `ref`. An apply that changes an attribute's type to or
+  from `ref` therefore adds or removes those rows before commit, under the
+  lock, as Pass 5 already does; this includes an attribute converted to `ref`
+  while hidden or in the same apply that re-adds it. Type changes stay a
+  locked, synchronous cost; record that in REPORT.md. Storage
+  stays free of type knowledge. Rows may point at targets deleted while the
+  ref was hidden; re-adding such a ref is what yields `dangling_reference`.
+- **Uniqueness of hidden facts.** Hidden unique values release their slots:
+  in rollout mode through the job (section 2), not under the lock; in strict
+  mode before commit. In rollout mode, until the job reaches an entity, its
+  hidden unique value can still collide with a new write (409); record that in
+  SPEC section 9 as a known limit.
+
+### 2. Background rollout
+
+- **Mode.** `PUT /v2/registry` accepts `mode?: "rollout" | "strict"`,
+  default `rollout`. `plan` reports the same violations as today and gains
+  `mode` in its input to say which of them would block.
+- **What rolls out.** Only two violation kinds become records instead of
+  blocking: `duplicate` (becoming unique, or un-hiding values that are now
+  duplicates) and `dangling_reference` (un-hiding a ref whose target is gone
+  or has the wrong shape). Every other violation (missing required, value no
+  longer decodes, shape removed with live entities, ref target or `on_delete`
+  changes that dangle existing refs) blocks with 409 in both modes, exactly as
+  today, using the Pass 5 classified preflight.
+- **Strict mode** is today's apply for duplicates and dangling refs: 409 if
+  any exist, otherwise **all** slot work for the change is done before commit:
+  releasing slots of values that become hidden first, then claiming slots for
+  values that become visible or unique. Strict mode starts no rollout. So a
+  strict apply that hides `x` in one shape and re-adds it in another moves the
+  slot atomically, and its preflight only looks at the desired visible data.
+  Soft removal (no fact writes) applies in both modes.
+- **Rollout mode** defers all slot work to the job, which does every release
+  for the rollout before any claim.
+- **Apply in rollout mode** writes the registry and a `rollouts` row
+  `(account_id, registry_version, status running|done|superseded, cursor,
+  processed, total, started_at, finished_at)` and commits. Target: exclusive
+  lock under 100 ms at 1M entities for both make-unique and remove-populated.
+- **The job** reconciles affected entities to the current registry: unique
+  slots, `live_refs` rows and violation records, nothing else. It runs as an
+  Effect fiber in the server process, in batches (start at 1,000 entities by
+  id) each in its own transaction under the **shared** account lock, so
+  entity writes keep going. It is idempotent per entity and resumes from
+  `cursor` after a restart. Only one instance works an account's rollout
+  (claim with `FOR UPDATE SKIP LOCKED` or a session advisory lock; your call,
+  justify it in REPORT.md). A later apply marks the running rollout
+  `superseded` and starts a new one against the new registry; the new one
+  must cover whatever the old one hadn't reached (simplest: the union of both
+  affected sets).
+- **Writes during a rollout** follow the new registry immediately. A write
+  that sets a newly unique attribute must claim the slot; if an entity the job
+  hasn't reached holds the same value without a slot, the writer still wins
+  and the job later records that entity as the duplicate.
+- **Duplicates.** The slot holder is whoever holds the slot; among entities
+  the job reconciles in one batch, the lowest id wins. Every other live entity
+  with that visible value gets a `duplicate` violation.
+
+### 3. Violation records
+
+- Table `violations (account_id, id, entity_id, attribute, issue, value,
+  status open|resolved, registry_version, opened_tx, opened_at, resolved_tx,
+  resolved_at)`. At most one open record per (entity, attribute, issue): a
+  unique ref can be both `duplicate` and `dangling_reference`, and gets both
+  records.
+- **Opened** by the rollout job (and by nothing else in this pass).
+- **Resolved** in the same transaction as whatever fixes it: the entity's
+  value changes or is retracted, the entity is deleted, the attribute stops
+  being unique or leaves the shape (resolved by the next rollout), the ref
+  target becomes valid, or the slot holder gives the value up. When a slot is
+  released and open duplicates for that value remain, the lowest-id one takes
+  the slot and its record resolves.
+- **Writes to an entity with an open violation** succeed if they don't make
+  things worse. Keeping a duplicate value unchanged while patching other
+  facts is allowed; setting a new duplicate value is 409 as usual.
+- **Outbox.** Opening and resolving each append an outbox item with
+  `automation_id: null`, `op: "violation_opened" | "violation_resolved"`,
+  `violation_id`, `attribute`, `issue`.
+- **HTTP.** `GET /v2/violations?status=open|resolved&attribute=&after=&limit=`
+  paged like the outbox. `GET /v2/registry` gains `rollout: { version,
+  status, processed, total } | null`. Entity reads gain `violations: [{
+  attribute, issue }]` listing open records.
+
+### 4. Tests and conformance
+
+- **New black-box suite `conformance/data-rollout.ts`** (Effect, no `src/`
+  imports, same style as the others). Cases: make unique over duplicates in
+  rollout mode returns 200 and duplicates appear as records once the rollout
+  is done (poll `GET /v2/registry`); a new duplicate write is 409 during and
+  after; fixing a duplicate resolves its record and the outbox shows both
+  events; strict mode returns 409 as before; remove an attribute from a shape
+  → reads hide it, history unchanged, re-add → values back; dropping an
+  attribute key is 422; changing a retired definition is 422; hide a ref,
+  delete its target (not blocked), re-add → `dangling_reference` record;
+  missing-required still 409 in rollout mode.
+- **Update existing suites** only where this pass changes the contract (for
+  example a case expecting 409 for duplicates on make-unique now sends
+  `mode: "strict"`); say which cases changed in REPORT.md.
+- **Differential property test (storage).** After random entity writes, random
+  registry changes in rollout mode and the job running to completion with
+  writes interleaved between batches (and some applies superseding a running
+  rollout), check against a from-scratch computation over the visible facts:
+  - `live_refs` equals the stored ref facts of live entities;
+    `dangling_reference` records equal the from-scratch set;
+  - for each unique attribute and visible value among live entities, exactly
+    one entity holds the slot and every other one has an open `duplicate`
+    record; no entity both holds the slot and has the record; there are no
+    slots or open records for hidden, deleted or no-longer-unique facts.
+  **Which** entity holds a slot is not compared: incumbents keep their slots,
+  so it depends on write order. A failed write is simply not replayed.
+- **Restart test:** stop the job mid-rollout, start a new Store, it finishes
+  from `cursor` with the same result.
+- **Supersede test:** a second apply during a rollout leaves a final state
+  that satisfies the same invariants as the property test for the latest
+  registry.
+- Keep every existing test and suite green.
+
+### 5. Benchmark
+
+Rerun the three Pass 5 apply scenarios at 1M in rollout mode and record,
+per scenario: exclusive lock time (target < 100 ms for all three), rollout
+duration and entities/s, same-account PATCH p50/p99 during the rollout
+(target p99 < 100 ms), and for make-unique the number of violation records
+(seed some duplicates so it's non-zero). Also rerun make-unique in strict
+mode on a separate duplicate-free attribute (strict mode rejects the seeded
+one), to show the locked slot writes still match Pass 5.
+
+### Constraints for this pass
+
+- Storage stays free of attribute-type knowledge; violation kinds and
+  visibility come from core (`compile()` output), not `"ref"` checks in
+  storage.
+- Do not change PostgreSQL configuration.
+- Commits: section 0, then soft removal, then rollout and violations, then
+  bench and report. Each behaviour commit updates SPEC.md.
+- If a decision here turns out wrong or contradictory, write QUESTIONS.md and
+  stop rather than guess.
+
+### REPORT.md "Pass 6" section
+
+Lock times and rollout numbers against the targets; which conformance cases
+changed and why; lines changed by layer; open limits (hidden unique values
+holding slots until the rollout reaches them, storage kept by hidden values,
+no purge).
+
+## Deferred: queries (formerly planned as Pass 5)
+
+Goal: a query is **another document kind** checked by the existing reference
+and typed-rule machinery, compiled to SQL with the inherited three-valued
+semantics intact. Decide storage first; the kind protocol is judged
+separately from the storage change.
+
+### 1. Storage decision (do this first, report it separately)
+
+Today `facts.value` is jsonb holding a JSON **string** of canonical JSON (to
+preserve NUL and lone surrogates), and `entities.document` is text. Neither is
+queryable by type. Add a live typed projection maintained in the write
+transaction like `live_unique`:
+
+    cells(account_id, entity_id, shape, attribute,
+          s text COLLATE "C", n numeric, b boolean, d date)
+
+one row per present live fact, exactly one typed column set (`enum`, `string`
+and `ref` use `s`; `integer`/`number` use `n`). An absent fact is an absent
+row. Index `(account_id, attribute, s|n|b|d, entity_id)` per column. Strings
+containing NUL cannot live in `text`: either reject NUL in string attributes
+from now on (registry-level decision, report it) or store such cells with a
+flag and evaluate them in memory. Say which and why. Facts and history are
+unchanged.
+
+### 2. The query kind (core)
+
+```json
+{ "id": "co-drivers", "shape": "employee",
+  "where": { "all": [ { "fact": "employee/work_state", "operator": "equal", "value": "CO" },
+                      { "fact": "employee/role", "operator": "equal", "value": "driver" } ] },
+  "order_by": [ { "attribute": "employee/salary", "direction": "desc" } ] }
+```
+
+Collection `queries`, order 45. `where` is a Rule checked exactly like policy
+rules; `order_by` (0–3 items) attributes must be in the shape and not `ref`.
+Field order: `id, shape, where, order_by`.
+
+### 3. Running
+
+- `POST /v2/queries/{id}/run` and `POST /v2/query` (an inline query document,
+  checked with the same kind checks; issues → 422) take
+  `{limit?: 1..200 (50), after?: <cursor>, match?: "true" | "unknown"}` and
+  return `{data: [entity], next_after}`. `match: "true"` returns entities
+  where `where` is T; `"unknown"` returns those where it is U. F never.
+- Order: `order_by` then entity id; absent values sort last in either
+  direction. Keyset cursor, opaque string.
+- Live data only. `as_of` queries are out of scope.
+
+### 4. Compiling rules to SQL
+
+One compiler `rule → SQL boolean expression` where SQL `NULL` is U:
+SQL's `AND`/`OR`/`NOT` over `NULL` match the inherited `all`/`any`/`not`
+tables; empty `all` → `TRUE`, empty `any` → `FALSE`; a condition on an absent
+cell → `NULL` except `exists`/`doesNotExist`. Specify exactly how
+`ignore_case` lowercases (Postgres `lower` vs JS `toLowerCase` differ outside
+ASCII) and make the in-memory evaluator agree.
+
+**Differential property test (the core of this pass):** for generated
+registries, entities and rules, the SQL result (T/F/U per entity, via
+`match`) equals the existing in-memory evaluator on every entity. Include
+absent facts, `in`/`notIn` with absent facts, `ignore_case` on non-ASCII,
+numeric boundaries, dates, and depth-20 rules.
+
+### 5. Core-change budget
+
+The query kind lives in core (it is generic). The SQL compiler lives in
+`src/storage/` and consumes rules plus compiled attribute metadata only.
+Target **≤ 60 net lines** of change in existing core files (new files for the
+kind are counted separately). Report every overrun.
+
+### REPORT.md "Pass 5" section
+
+The storage decision and its cost; kind-protocol fit, file by file; the
+differential test's case count and anything it found; query latency on the
+benchmark data with and without the cell indexes (add to `make bench`);
+results of all conformance suites including a new `conformance/data-queries.ts`.
