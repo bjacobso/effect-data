@@ -798,75 +798,89 @@ lookup account for about 5.9 s of sampled time. With one migration step per
 entity, the lookup examines about 500 billion entries at one million
 retractions.
 
+A focused, one-million-entity run of the same Phase A code profiled
+attach-optional separately. Of 86.18 s wall time, the top sampled frames
+were `(idle)` at 50.53 s, `stepProperty` at 4.78 s,
+`fromIteratorEagerUnsafe` at 3.76 s, `compare` at 3.62 s and `writeBuffer`
+at 2.36 s. `onItem` and `parseChecks` contributed another 3.67 s of
+sampled schema work. [Focused measurements](bench/results-pass5-investigation-focused.json)
+· [Full-size attach CPU profile](bench/pass5-attach-1000000.cpuprofile.gz)
+
 #### One-million-entity apply phases
 
 Each cell gives milliseconds / statements. Rollback time falls in the last
 measured phase for make-unique.
 
-| Phase | Attach optional | Make unique (rollback) |
-| --- | ---: | ---: |
-| Start transaction | 0.276 / 0 | 0.765 / 0 |
-| Wait for account lock | 0.252 / 1 | 0.387 / 1 |
-| Read registry | 0.975 / 1 | 2.782 / 1 |
-| Load and parse live entities | 1,575.752 / 1 | 1,574.729 / 1 |
-| Registry checks and diff | 2.232 / 0 | 2.528 / 0 |
-| Entity revalidation | 20,185.055 / 0 | 21,182.785 / 0 |
-| Plan-to-stage overhead | 0.338 / 0 | 0.130 / 0 |
-| Staging, uniqueness and edges | 61,946.675 / 1,000,000 | 5,365.678 / 75,153 |
-| Registry write | 7.941 / 1 | — |
-| Transaction completion | 1.218 / 0 | — |
+| Phase | Attach optional | Make unique (rollback) | Remove populated |
+| --- | ---: | ---: | ---: |
+| Start transaction | 0.276 / 0 | 0.765 / 0 | 0.159 / 0 |
+| Wait for account lock | 0.252 / 1 | 0.387 / 1 | 0.150 / 1 |
+| Read registry | 0.975 / 1 | 2.782 / 1 | 0.530 / 1 |
+| Load and parse live entities | 1,575.752 / 1 | 1,574.729 / 1 | 1,343.570 / 1 |
+| Registry checks and diff | 2.232 / 0 | 2.528 / 0 | 1.667 / 0 |
+| Entity revalidation | 20,185.055 / 0 | 21,182.785 / 0 | 19,671.444 / 0 |
+| Plan-to-stage overhead | 0.338 / 0 | 0.130 / 0 | 0.037 / 0 |
+| Staging, uniqueness and edges | 61,946.675 / 1,000,000 | 5,365.678 / 75,153 | 117,352.171 / 2,000,000 |
+| Registry write | 7.941 / 1 | — | 1.146 / 1 |
+| Clock reserve | — | — | 0.778 / 1 |
+| Flush inserts and assembly | — | — | 35,751,911.700 / 338 |
+| Transaction completion | 1.218 / 0 | — | 4.852 / 0 |
 
 - **H1 confirmed.** Attach-optional issued one `live_unique` `DELETE` per
-  entity, even without a unique attribute. Retractions called
-  it in both `stage` and the apply loop, measured at two per entity in the
-  30,000-entity run.
+  entity, even without a unique attribute. Retractions called it in both
+  `stage` and the apply loop, issuing two million deletes at full size.
 - **H2 confirmed.** Registry checks and the diff took 2.2 ms for the
   one-million-entity attach. Revalidation took 20.19 s, including sorting,
   retained facts, references and Effect Schema decoding. The profile shows
   property decoding among the top active frames.
 - **H3 confirmed.** Attach loaded and parsed a million documents in 1.58 s.
   RSS crossed 1.02 GiB immediately after the load and peaked at 1.12 GiB.
+  The process peak reached 2.66 GiB during removal.
 - **H4 confirmed.** For the attach, 83.720 s of the 83.721 s wall time fell
   inside the exclusive lock. Same-account PATCH p50 and p99 were both about
   83.75 s.
 
-The original one-million-entity removal was still holding the account lock
-after 22 minutes in projection assembly alone. The 30,000-entity profile
-above isolates that cost and the smaller run provides completed PATCH and
-replay measurements while the full removal runs.
+The original removal completed with an exclusive lock hold of 9 h 58 min
+10 s. The two frames around the projection lookup at `Store.ts:199` and
+`:203` account for about 35,609 s in the full run's Node CPU profile. A
+native process sample at seven hours resolved the stack to
+`ArrayPrototypeFindLast` under `ArrayMap`. The original version 3 fixture
+committed one million migration retractions with zero live projections
+retaining `bench/state`. [Full investigation measurements](bench/results-pass5-investigation.json)
 
-#### PATCH and `as_of` breakdown at 30,000 entities
+#### PATCH and `as_of` breakdown at one million entities
 
-Average phase times in milliseconds. Each PATCH sent 10 statements plus
+The full investigation gathered the following average phase times in
+milliseconds. Each PATCH sent 10 statements plus
 `BEGIN` and `COMMIT`. The seven single-statement steps were account lock,
 entity read, registry read, ref validation, uniqueness, ref update and clock
 reservation. The flush sent three inserts.
 
 | PATCH phase | 1 worker | 16 workers, one account |
 | --- | ---: | ---: |
-| Transaction startup | 0.080 | 0.101 |
-| Account lock | 0.059 | 0.072 |
-| Entity read | 0.085 | 0.097 |
-| Registry read | 0.122 | 0.124 |
-| Decode | 0.039 | 0.029 |
-| Ref validation | 0.088 | 0.105 |
-| Staging and automations | 0.013 | 0.009 |
-| Uniqueness | 0.073 | 0.082 |
-| Ref update | 0.127 | 0.159 |
-| Clock reserve | 0.080 | 8.607 |
-| Flush | 0.272 | 0.367 |
-| Transaction completion | 0.156 | 0.226 |
-| Writes/s | 827 | 1,548 |
-| PATCH p50 / p99 (ms) | 1.154 / 2.730 | 6.192 / 48.255 |
+| Transaction startup | 0.093 | 0.091 |
+| Account lock | 0.061 | 0.063 |
+| Entity read | 0.096 | 0.080 |
+| Registry read | 0.129 | 0.117 |
+| Decode | 0.041 | 0.029 |
+| Ref validation | 0.093 | 0.100 |
+| Staging and automations | 0.013 | 0.010 |
+| Uniqueness | 0.080 | 0.079 |
+| Ref update | 0.102 | 0.128 |
+| Clock reserve | 0.081 | 8.207 |
+| Flush | 0.291 | 0.333 |
+| Transaction completion | 0.180 | 0.237 |
+| Writes/s | 783 | 1,636 |
+| PATCH p50 / p99 (ms) | 1.139 / 3.278 | 7.272 / 42.587 |
 
 `as_of` uses two statements per read. SQL includes driver transfer and row
 decoding. Each latency used 30 samples.
 
 | History facts | SQL rows (events + facts) | Average SQL ms | Average replay ms | p50 / p99 ms |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 14 | 0.245 | 0.004 | 0.233 / 0.419 |
-| 1,000 | 1,994 | 1.592 | 0.079 | 1.638 / 2.645 |
-| 10,000 | 19,994 | 12.784 | 0.703 | 13.205 / 14.635 |
+| 10 | 14 | 0.243 | 0.003 | 0.206 / 0.592 |
+| 1,000 | 1,994 | 2.068 | 0.099 | 1.956 / 5.169 |
+| 10,000 | 19,994 | 12.151 | 0.648 | 12.729 / 13.791 |
 
 ### Apply fixes at one million live entities
 
@@ -879,6 +893,7 @@ The timings are individual local runs. The investigation used `--cpu-prof`.
 | --- | --- | ---: | ---: | ---: |
 | A | Attach optional | 83.721 | 83.720 | 83,750.67 / 83,757.43 |
 | A | Make unique (rollback) | 28.130 | 28.129 | 28,135.15 / 28,141.13 |
+| A | Remove populated | 35,890.288 | 35,890.288 | 35,890,369.29 / 35,890,380.28 |
 | B1 | Attach optional | 21.494 | 21.493 | 21,516.32 / 21,527.29 |
 | B1 | Make unique | 273.190 | 273.189 | 273,228.11 / 273,236.29 |
 | B1 | Remove populated | 150.206 | 150.206 | 151,912.29 / 151,986.39 |
@@ -915,11 +930,62 @@ retractions before taking the account lock. The write transaction checks
 the registry version again and reads the event tail. Changes to a unique
 value or ref target also update the checks that depend on it. Storage tests
 cover a new duplicate, a repaired duplicate, a concurrently deleted ref
-target and a write to an entity that will be retracted.
+target and a write to an entity about to undergo a migration retraction.
 
 The one-million-row snapshot used 201 page reads for each expensive apply.
+`EXPLAIN` showed an index-only scan on creation events and primary-key
+lookups on live projections for a page of 5,000 candidates.
 Make-unique moved 10.52 s before the lock and reduced uniqueness statements
 from four million to 200. Inserting the million slots and their interned
 values still took 37.46 s under the lock. Removal moved 9.66 s before the
 lock and spent 118.22 s in the atomic flush of events, facts and
-projections. [B3 measurements](bench/results-pass5-b3.json)
+projections. The resulting version 4 fixture had exactly one million
+migration retractions and zero live projections retaining `bench/state`.
+[B3 measurements](bench/results-pass5-b3.json)
+
+### Targets and remaining costs
+
+- **Attach optional met the target.** The exclusive lock held for 2.21 ms
+  against the 100 ms target. Concurrent PATCH p99 fell from 83.76 s to
+  18.80 ms.
+- **Make unique missed the target.** The exclusive lock held for 37.47 s
+  against the 5 s target. Writing one million uniqueness slots and their
+  interned values in one transaction dominates that time. A later pass can
+  investigate preparing those projections outside the exclusive transaction
+  and catching them up before cutover.
+- **Remove populated held the lock for 118.36 s, down from 9 h 58 min.** The
+  atomic write of the million retractions dominates. An online migration
+  would need to stage these writes and make them visible together at cutover.
+
+Phase C was skipped. With 16 PATCH workers on one account, reservation of
+the per-account clock dominates. The clock row serializes allocation of
+`tx` and `at` through commit, so shortening that critical section requires
+more than removing a single round trip. For `as_of`, an indexed lookup of
+the latest event at the requested time and the latest fact for each
+historical attribute at that event's `tx` could bring the 10,000-row
+fixture from 19,994 returned rows to eight. That would eliminate client
+replay and reduce result transfer. The SQL plan would need to be measured
+separately to quantify server-side savings.
+
+### Source size and verification
+
+Physical TypeScript lines from the Phase 0 commit to the end of B3.
+
+| Source layer | Before | After | Net |
+| --- | ---: | ---: | ---: |
+| Core | 649 | 842 | +193 |
+| Storage | 505 | 697 | +192 |
+| HTTP | 351 | 351 | 0 |
+| Packs | 292 | 292 | 0 |
+| Composition and migration wiring | 97 | 98 | +1 |
+| **Total `src/`** | **1,894** | **2,280** | **+386** |
+
+The source exceeds the original 1,200-line budget. The pass adds scoped
+validation and dependency tracking in core, snapshot preparation and batch
+projection writes in storage, and phase timing at both layers. The
+additional SQL migration adds a nine-line index definition outside `src/`.
+
+`make test` passed all 45 tests. Against `make run`, `data.ts` passed 15/15,
+`data-certs.ts` passed 6/6, and `data-refs.ts` passed 7/7. With
+`PACKS=onboarding`, `data.ts` passed 15/15 again. Both server runs were
+stopped.
