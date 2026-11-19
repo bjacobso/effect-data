@@ -34,6 +34,19 @@ export function coreApi(engine: EngineValue) {
             error: errors,
           }),
           HttpApiEndpoint.delete("remove", "/v2/entities/:id", { params, success: HttpApiSchema.NoContent, error: errors }),
+          HttpApiEndpoint.get("referrers", "/v2/entities/:id/referrers", {
+            params,
+            success: Schema.Struct({
+              data: Schema.Array(
+                Schema.Struct({
+                  entity_id: Schema.String,
+                  attribute: Schema.String,
+                  on_delete: Schema.Literals(["block", "clear"]),
+                }),
+              ),
+            }),
+            error: errors,
+          }),
           HttpApiEndpoint.get("history", "/v2/entities/:id/history", {
             params,
             success: Schema.Struct({
@@ -44,7 +57,7 @@ export function coreApi(engine: EngineValue) {
                   attribute: Schema.String,
                   op: Schema.String,
                   value: scalar,
-                  reason: Schema.String,
+                  reason: Schema.Literals(["api", "automation", "migration", "reference"]),
                   actor: Schema.String,
                 }),
               ),
@@ -169,6 +182,7 @@ export const CoreHttpLive = Layer.unwrap(
               }),
             ),
           remove: ({ params }) => onEntity(params.id, (id, account, actor) => store.remove(account, actor, id)),
+          referrers: ({ params }) => onEntity(params.id, (id, account) => store.referrers(account, id)),
           history: ({ params }) => onEntity(params.id, (id, account) => store.history(account, id)),
           outbox: ({ query }) =>
             respond(

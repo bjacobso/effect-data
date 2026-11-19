@@ -14,6 +14,8 @@ import {
   defineKind,
   defineOp,
   type Action,
+  type Attribute,
+  type Edge,
 } from "./model.ts";
 import type { Ops } from "./registry.ts";
 import { ruleSchema, ruleRefs, typedRule } from "./rules.ts";
@@ -41,29 +43,43 @@ export const setOp = defineOp(
     },
   },
 );
+export function attributeEdges(attributes: readonly Attribute[]) {
+  const edges = new Map<string, Edge>();
+  for (const a of attributes)
+    if (a.type === "ref" && a.target !== undefined) edges.set(a.key, { target: a.target, on_delete: a.on_delete ?? "block" });
+  return edges;
+}
 export const AttributeSchema = Schema.Struct({
   key,
-  type: Schema.Literals(["string", "integer", "number", "boolean", "date", "enum"]),
+  type: Schema.Literals(["string", "integer", "number", "boolean", "date", "enum", "ref"]),
   values: Schema.optionalKey(list(text(1, 200), 1, 100)),
   label: Schema.optionalKey(text(1, 200)),
   unique: Schema.optionalKey(Schema.Boolean),
+  target: Schema.optionalKey(shapeKey),
+  on_delete: Schema.optionalKey(Schema.Literals(["block", "clear"])),
 });
 export const attributeKind = defineKind(AttributeSchema, {
   name: "attribute",
   collection: "attributes",
   identity: "key",
   order: 10,
-  fields: ["key", "type", "values", "label", "unique"],
-  references: () => [],
+  fields: ["key", "type", "values", "label", "unique", "target", "on_delete"],
+  references: (d) => (d.type === "ref" && d.target !== undefined ? [{ path: "target", to: "shape", key: d.target }] : []),
   check: () => [],
-  structure: (d) =>
-    d.type === "enum"
-      ? d.values === undefined
-        ? [issue("values", "Enum values required")]
-        : distinct(d.values, "values")
-      : d.values !== undefined
-        ? [issue("values", "Only enum supports values")]
-        : [],
+  structure: (d) => {
+    const errors = [];
+    if (d.type === "enum") {
+      if (d.values === undefined) errors.push(issue("values", "Enum values required"));
+      else errors.push(...distinct(d.values, "values"));
+    } else if (d.values !== undefined) errors.push(issue("values", "Only enum supports values"));
+    if (d.type === "ref") {
+      if (d.target === undefined) errors.push(issue("target", "Ref target required"));
+    } else {
+      if (d.target !== undefined) errors.push(issue("target", "Only refs support target"));
+      if (d.on_delete !== undefined) errors.push(issue("on_delete", "Only refs support on_delete"));
+    }
+    return errors;
+  },
 });
 export const ShapeSchema = Schema.Struct({
   key: shapeKey,
@@ -81,7 +97,11 @@ export const shapeKind = defineKind(ShapeSchema, {
     ...d.attributes.map((k, i) => ({ path: `attributes[${i}]`, to: "attribute" as const, key: k })),
     ...(d.required ?? []).map((k, i) => ({ path: `required[${i}]`, to: "attribute" as const, key: k, context: { members: d.attributes } })),
   ],
-  check: () => [],
+  check: (d, r) =>
+    (d.required ?? []).flatMap((key, i) => {
+      const a = d.attributes.includes(key) ? findAttribute(r, key) : undefined;
+      return a?.type === "ref" && a.on_delete === "clear" ? [issue(`required[${i}]`, "Required ref cannot be cleared")] : [];
+    }),
   structure: (d) => [...distinct(d.attributes, "attributes"), ...distinct(d.required ?? [], "required")],
 });
 export function automationKind(ops: Ops) {

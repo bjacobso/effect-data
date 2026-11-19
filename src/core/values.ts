@@ -28,6 +28,7 @@ export function valueSchema(a: Attribute): Schema.Codec<string | number | boolea
   const ast = R.fromRepresentation({ representation: base, references: {} }, { revivers: [] }).ast;
   let schema: Schema.Codec<unknown> = Schema.make(ast);
   if (a.type === "string") schema = Schema.make<Schema.Codec<string>>(schema.ast).check(codePoints());
+  if (a.type === "ref") schema = Schema.make<Schema.Codec<string>>(schema.ast).check(Schema.isPattern(/^en_[A-Za-z0-9_-]{21}$/u));
   if (a.type === "date") schema = Schema.make<Schema.Codec<string>>(schema.ast).check(Schema.isPattern(datePattern), dateCheck());
   if (a.type === "number") schema = Schema.make<Schema.Codec<number>>(schema.ast).check(Schema.isFinite());
   if (a.type === "integer") schema = Schema.make<Schema.Codec<number>>(schema.ast).check(Schema.isInt());

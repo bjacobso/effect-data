@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Schedule } from "effect";
 import { SqlClient } from "effect/sql";
+import { SqlError } from "effect/sql/SqlError";
 import { Engine, type Compiled } from "../core/engine.ts";
+import { liveRefs } from "./liveRefs.ts";
 import { Clock } from "./Clock.ts";
 import {
   type Registry,
@@ -22,7 +24,15 @@ import { ensure, ensureApplicable, NotFound, Conflict } from "../Errors.ts";
 // JSON text inside jsonb preserves NUL and lone surrogates.
 export const encodeValue = (v: unknown) => JSON.stringify(canonical(v));
 export const decodeValue = (v: string): Value => JSON.parse(v);
-export type Fact = { tx: number; at: string; attribute: string; op: string; value: string; reason: string; actor: string };
+export type Fact = {
+  tx: number;
+  at: string;
+  attribute: string;
+  op: string;
+  value: string;
+  reason: "api" | "automation" | "migration" | "reference";
+  actor: string;
+};
 type Event = { tx: number; at: string; kind: string; shape: string; version: number; registry_version: number; created_at: string };
 type Step = { entity: Entity; keys: string[]; before: Facts; actor: string; reason: string; kind: string };
 type Delivery = { index: number; entity_id: string; automation_id: string; action: Doc };
@@ -32,6 +42,17 @@ export const makeStore = (hashOverride?: string) =>
     const sql = yield* SqlClient.SqlClient,
       app = yield* Engine,
       clock = yield* Clock;
+    const refs = liveRefs(sql);
+    // Cascade and mutation row locks can form a cycle. Retry only when SQL
+    // reports that the transaction was aborted as the deadlock victim.
+    const writeTransaction = <A, E>(work: Effect.Effect<A, E>) =>
+      sql.withTransaction(work).pipe(
+        Effect.retry({
+          while: (error) => error instanceof SqlError && error.reason._tag === "DeadlockError",
+          times: 5,
+          schedule: Schedule.jittered(Schedule.exponential("10 millis")),
+        }),
+      );
     const nonempty = <A>(rows: A[]): [A, ...A[]] => [rows[0]!, ...rows.slice(1)];
     const cache = new Map<string, Compiled>();
     const compiled = (account: string, version: number, registry: Registry) => {
@@ -57,13 +78,18 @@ export const makeStore = (hashOverride?: string) =>
       sql<{ document: string }>`SELECT document FROM entities WHERE account_id=${account} AND NOT deleted`.pipe(
         Effect.map((rows) => rows.map((r) => JSON.parse(r.document) as Entity)),
       );
-    const getLive = (account: string, id: string, forUpdate = false) =>
+    const getLive = (account: string, id: string, mode?: "write" | "delete" | "reference") =>
       Effect.gen(function* () {
-        const rows = forUpdate
-          ? yield* sql<{
-              document: string;
-            }>`SELECT document FROM entities WHERE account_id=${account} AND id=${id} AND NOT deleted FOR UPDATE`
-          : yield* sql<{ document: string }>`SELECT document FROM entities WHERE account_id=${account} AND id=${id} AND NOT deleted`;
+        const locking =
+          mode === "write"
+            ? sql`FOR NO KEY UPDATE`
+            : mode === "delete"
+              ? sql`FOR UPDATE`
+              : mode === "reference"
+                ? sql`FOR KEY SHARE`
+                : sql``;
+        const rows = yield* sql<{ document: string }>`SELECT document FROM entities
+          WHERE account_id=${account} AND id=${id} AND NOT deleted ${locking}`;
         if (!rows[0]) return yield* Effect.fail(new NotFound());
         return JSON.parse(rows[0].document) as Entity;
       });
@@ -98,6 +124,7 @@ export const makeStore = (hashOverride?: string) =>
       before: Entity | undefined,
       entity: Entity,
       registry: Registry,
+      edges: Compiled["edges"],
       actor: string,
       reason: string,
       kind = "write",
@@ -110,6 +137,7 @@ export const makeStore = (hashOverride?: string) =>
         const next = { ...entity, version: (before?.version ?? 0) + 1, created_at: before?.created_at ?? "" };
         if (kind === "delete") yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
         else yield* unique(account, next, registry);
+        if (edges.size) yield* refs.update(account, next, keys, edges);
         steps.push({ entity: next, keys, before: before?.facts ?? {}, actor, reason, kind });
         return next;
       });
@@ -161,50 +189,43 @@ export const makeStore = (hashOverride?: string) =>
           yield* sql`INSERT INTO outbox ${sql.insert(nonempty(deliveries.map((d) => ({ account_id: account, at: events[d.index]!.at, entity_id: d.entity_id, automation_id: d.automation_id, document: JSON.stringify(d.action) }))))}`;
         return projections;
       });
-    const validate = (account: string, version: number, registry: Registry, shape: string, facts: Facts) => {
-      const schema = compiled(account, version, registry).schemas.get(shape);
+    const validate = (c: Compiled, shape: string, facts: Facts) => {
+      const schema = c.schemas.get(shape);
       return schema ? decodeIssues(schema, facts).map((x) => issue(`facts.${x.field}`, x.issue)) : [issue("shape", "Unknown shape")];
     };
     const mutate = (account: string, actor: string, body: Mutation, id?: string) =>
-      sql.withTransaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* lock(account);
-          const before = id ? yield* getLive(account, id, true) : undefined,
+          const before = id ? yield* getLive(account, id, "write") : undefined,
             { version, registry } = yield* getRegistry(account);
           if (before && body.expected_version !== undefined && before.version !== body.expected_version)
             return yield* Effect.fail(new Conflict({ issues: [] }));
           const shape = before?.shape ?? body.shape ?? "",
-            facts = merge(before?.facts ?? {}, body.facts);
+            facts = merge(before?.facts ?? {}, body.facts),
+            c = compiled(account, version, registry);
           const unknown = Object.keys(body.facts)
             .filter((k) => !findShape(registry, shape)?.attributes.includes(k))
             .map((k) => issue(`facts.${k}`, "Unknown attribute"));
-          yield* ensure([...validate(account, version, registry, shape, facts), ...(findShape(registry, shape) ? unknown : [])]);
+          yield* ensure([...validate(c, shape, facts), ...(findShape(registry, shape) ? unknown : [])]);
           const steps: Step[] = [],
             deliveries: Delivery[] = [],
             effects: (Action & { automation_id: string })[] = [];
-          let entity = yield* stage(
-            steps,
-            account,
-            before,
-            {
-              id: id ?? `en_${randomBytes(16).toString("base64url").slice(0, 21)}`,
-              shape,
-              facts,
-              version: 0,
-              registry_version: version,
-              created_at: "",
-              updated_at: "",
-            },
-            registry,
-            actor,
-            "api",
-            before ? "write" : "create",
-          );
+          const initial = {
+            id: id ?? `en_${randomBytes(16).toString("base64url").slice(0, 21)}`,
+            shape,
+            facts,
+            version: 0,
+            registry_version: version,
+            created_at: "",
+            updated_at: "",
+          };
+          if (c.edges.size) yield* refs.validate(account, initial, c.edges);
+          let entity = yield* stage(steps, account, before, initial, registry, c.edges, actor, "api", before ? "write" : "create");
           const changed = Object.keys({ ...before?.facts, ...facts }).filter(
             (k) => canonical(before?.facts[k] ?? null) !== canonical(facts[k] ?? null),
           );
-          const c = compiled(account, version, registry),
-            candidates = new Set(changed.flatMap((k) => (c.reactions.get(k) ?? []).map((a) => a.id)));
+          const candidates = new Set(changed.flatMap((k) => (c.reactions.get(k) ?? []).map((a) => a.id)));
           for (const a of registry.automations)
             if (
               a.shape === shape &&
@@ -215,17 +236,14 @@ export const makeStore = (hashOverride?: string) =>
                 effects.push({ ...action, automation_id: a.id });
                 const instruction = app.ops[action.op]!.handler(action);
                 if (instruction.type === "set") {
-                  const updated = merge(entity.facts, { [instruction.attribute]: instruction.value });
-                  yield* ensure(validate(account, version, registry, shape, updated));
-                  entity = yield* stage(
-                    steps,
-                    account,
-                    entity,
-                    { ...entity, facts: updated, registry_version: version },
-                    registry,
-                    `automation:${a.id}`,
-                    "automation",
-                  );
+                  const updated = {
+                    ...entity,
+                    facts: merge(entity.facts, { [instruction.attribute]: instruction.value }),
+                    registry_version: version,
+                  };
+                  yield* ensure(validate(c, shape, updated.facts));
+                  if (c.edges.size) yield* refs.validate(account, updated, c.edges);
+                  entity = yield* stage(steps, account, entity, updated, registry, c.edges, `automation:${a.id}`, "automation");
                 } else deliveries.push({ index: steps.length - 1, entity_id: entity.id, automation_id: a.id, action: instruction.payload });
               }
           const committed = yield* flush(account, steps, deliveries);
@@ -244,6 +262,9 @@ export const makeStore = (hashOverride?: string) =>
           yield* ensure(result.issues);
           yield* ensureApplicable(result.violations.map((v) => issue(`${v.entity_id}.${v.field}`, v.issue)));
           const steps: Step[] = [];
+          const previous = compiled(account, current.version, current.registry).edges;
+          // The desired version is not committed yet, so keep it out of the cache.
+          const edges = app.compile(desired).edges;
           for (const e of entities) {
             const after = yield* stage(
               steps,
@@ -251,11 +272,16 @@ export const makeStore = (hashOverride?: string) =>
               e,
               { ...e, facts: retain(e.facts, findShape(desired, e.shape)!), registry_version: current.version + 1 },
               desired,
+              edges,
               actor,
               "migration",
             );
             yield* unique(account, after, desired);
           }
+          function* retained() {
+            for (const e of entities) yield { ...e, facts: retain(e.facts, findShape(desired, e.shape)!) };
+          }
+          if (previous.size || edges.size) yield* refs.reconcile(account, previous, edges, retained());
           const version = current.version + 1;
           yield* sql`INSERT INTO registries(account_id,version,document) VALUES (${account},${version},${JSON.stringify(desired)}) ON CONFLICT(account_id) DO UPDATE SET version=EXCLUDED.version,document=EXCLUDED.document`;
           yield* flush(account, steps);
@@ -292,14 +318,52 @@ export const makeStore = (hashOverride?: string) =>
         };
       });
     const remove = (account: string, actor: string, id: string) =>
+      writeTransaction(
+        Effect.gen(function* () {
+          yield* lock(account);
+          const before = yield* getLive(account, id, "delete"),
+            { version, registry } = yield* getRegistry(account),
+            { edges } = compiled(account, version, registry),
+            steps: Step[] = [];
+          const incoming = edges.size ? (yield* refs.incoming(account, id, edges)).filter((row) => row.entity_id !== id) : [];
+          yield* ensureApplicable(
+            incoming
+              .filter((row) => row.on_delete === "block")
+              .map((row) => issue(`${row.entity_id}.facts.${row.attribute}`, "Referenced")),
+          );
+          yield* stage(
+            steps,
+            account,
+            before,
+            { ...before, facts: {}, registry_version: version },
+            registry,
+            edges,
+            actor,
+            "api",
+            "delete",
+          );
+          let referrer: Entity | undefined;
+          for (const row of incoming) {
+            if (referrer?.id !== row.entity_id) {
+              referrer = yield* getLive(account, row.entity_id, "write").pipe(Effect.catchTag("NotFound", () => Effect.succeed(undefined)));
+            }
+            // A concurrent writer may have retracted or redirected this edge
+            // while we waited for the referrer's row lock.
+            if (referrer?.facts[row.attribute] !== id) continue;
+            const after = { ...referrer, facts: merge(referrer.facts, { [row.attribute]: null }), registry_version: version };
+            referrer = yield* stage(steps, account, referrer, after, registry, edges, `reference:${id}`, "reference");
+          }
+          yield* flush(account, steps);
+        }),
+      );
+    const referrers = (account: string, id: string) =>
       sql.withTransaction(
         Effect.gen(function* () {
           yield* lock(account);
-          const before = yield* getLive(account, id, true),
-            { version, registry } = yield* getRegistry(account),
-            steps: Step[] = [];
-          yield* stage(steps, account, before, { ...before, facts: {}, registry_version: version }, registry, actor, "api", "delete");
-          yield* flush(account, steps);
+          yield* getLive(account, id, "reference");
+          const { version, registry } = yield* getRegistry(account);
+          const { edges } = compiled(account, version, registry);
+          return { data: yield* refs.incoming(account, id, edges) };
         }),
       );
     const plan = (account: string, desired: Registry) =>
@@ -323,7 +387,7 @@ export const makeStore = (hashOverride?: string) =>
           next_after: rows.length ? Number(rows.at(-1)!.seq) : null,
         })),
       );
-    return { getRegistry, compiled, live, getLive, mutate, apply, history, asOf, remove, plan, outbox, sql };
+    return { getRegistry, compiled, live, getLive, mutate, apply, history, asOf, remove, referrers, plan, outbox, sql };
   });
 export type StoreValue = Effect.Success<ReturnType<typeof makeStore>>;
 export class Store extends Context.Service<Store, StoreValue>()("data/Store") {

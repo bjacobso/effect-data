@@ -15,6 +15,7 @@ import {
   findShape,
   findAttribute,
 } from "./model.ts";
+import { attributeEdges } from "./kinds.ts";
 import { evaluator } from "./rules.ts";
 import { valueSchema } from "./values.ts";
 import { KindRegistry, type RegisteredKind } from "./registry.ts";
@@ -89,7 +90,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
     const reactions = new Map<string, Automation[]>();
     for (const d of r.automations ?? []) for (const key of d.on.changed) reactions.set(key, [...(reactions.get(key) ?? []), d]);
-    return { schemas, attributes, rules, reactions };
+    return { schemas, attributes, rules, reactions, edges: attributeEdges(r.attributes ?? []) };
   }
   function validate(r: Registry, shape: string, facts: Facts): Issue[] {
     const s = findShape(r, shape);
@@ -113,19 +114,33 @@ export function engine(kinds: readonly RegisteredKind[]) {
     const violations: (Issue & { entity_id: string })[] = [],
       seen = new Set<string>();
     const compiled = issues.length ? undefined : compile(desired);
-    if (!issues.length)
+    const edges = compiled?.edges ?? attributeEdges(desired.attributes);
+    const targets = new Map<string, string>();
+    const shapes = new Map(desired.shapes.map((s) => [s.key, s]));
+    if (edges.size) for (const e of live) if (shapes.has(e.shape)) targets.set(e.id, e.shape);
+    if (compiled || edges.size)
       for (const e of [...live].sort((a, b) => compare(a.id, b.id))) {
-        const s = findShape(desired, e.shape),
+        const s = shapes.get(e.shape),
           facts = s ? retain(e.facts, s) : {};
-        const errors = s
-          ? decodeIssues(compiled!.schemas.get(e.shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue))
-          : [issue("shape", "Unknown shape")];
-        for (const [k, v] of Object.entries(facts))
-          if (findAttribute(desired, k)?.unique) {
+        const errors = !compiled
+          ? []
+          : s
+            ? decodeIssues(compiled.schemas.get(e.shape)!, facts).map((x) => issue(`facts.${x.field}`, x.issue))
+            : [issue("shape", "Unknown shape")];
+        for (const [k, v] of Object.entries(facts)) {
+          const edge = edges.get(k);
+          if (edge && (typeof v !== "string" || targets.get(v) !== edge.target)) {
+            const field = `facts.${k}`;
+            const existing = errors.findIndex((x) => x.field === field);
+            if (existing >= 0) errors.splice(existing, 1);
+            errors.push(issue(field, "Dangling reference"));
+          }
+          if (compiled && findAttribute(desired, k)?.unique) {
             const identity = canonical([k, v]);
             if (seen.has(identity)) errors.push(issue(`facts.${k}`, "Duplicate unique value"));
             else seen.add(identity);
           }
+        }
         violations.push(...errors.map((x) => ({ entity_id: e.id, ...x })));
       }
     violations.sort((a, b) => compare(a.entity_id, b.entity_id) || compare(a.field, b.field));

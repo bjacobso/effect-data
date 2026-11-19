@@ -66,12 +66,22 @@ With the default packs running, also verify:
 BASE_URL=http://localhost:8086 node conformance/data-certs.ts
 ```
 
+Ref attributes store an entity ID from the same account and declare a target
+shape. Deletion blocks by default. An optional `on_delete: "clear"`
+retracts the incoming fact and records it in history with reason
+`reference`. Preview the live incoming edges at
+`GET /v2/entities/{id}/referrers`.
+
+```sh
+BASE_URL=http://localhost:8086 node conformance/data-refs.ts
+```
+
 The Pass 4 benchmark invokes the Store directly. Create the dedicated
 `onb_data_bench` database once and run the matched ref workload with:
 
 ```sh
 createdb -h localhost onb_data_bench
-BENCH_MODE=refs make bench
+make bench
 ```
 
 Use `BENCH_DATABASE_URL` to override the connection URL. Each run recreates

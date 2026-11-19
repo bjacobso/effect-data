@@ -33,7 +33,7 @@ const ErrorBody = Schema.Struct({
     details: Schema.optionalKey(Schema.Array(Issue)),
   }),
 });
-const fromText = <A>(schema: Schema.Codec<A>) => Schema.decodeUnknownEffect(Schema.fromJsonString(schema));
+const fromText = <A>(schema: Schema.Codec<A>) => Schema.decodeUnknownEffect(Schema.fromJsonString(schema), { onExcessProperty: "error" });
 type Reply = { status: number; text: string; error?: typeof ErrorBody.Type.error };
 export const req = <A>(
   schema: Schema.Codec<A>,
@@ -120,10 +120,12 @@ const Action = Schema.Struct({
 });
 const Attribute = Schema.Struct({
   key: Schema.String,
-  type: Schema.Literals(["string", "integer", "number", "boolean", "date", "enum"]),
+  type: Schema.Literals(["string", "integer", "number", "boolean", "date", "enum", "ref"]),
   values: Schema.optionalKey(strings),
   label: Schema.optionalKey(Schema.String),
   unique: Schema.optionalKey(Schema.Boolean),
+  target: Schema.optionalKey(Schema.String),
+  on_delete: Schema.optionalKey(Schema.Literals(["block", "clear"])),
 });
 const Shape = Schema.Struct({
   key: Schema.String,
@@ -197,7 +199,7 @@ export const History = Schema.Struct({
       attribute: Schema.String,
       op: Schema.Literals(["assert", "retract"]),
       value: Scalar,
-      reason: Schema.Literals(["api", "automation", "migration"]),
+      reason: Schema.Literals(["api", "automation", "migration", "reference"]),
       actor: Schema.String,
     }),
   ),

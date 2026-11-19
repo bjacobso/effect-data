@@ -118,6 +118,70 @@ describe("registry pipeline", () => {
     expect(evaluator(date)({ "employee/start": "2026-01-01" })).toBe("T");
     expect(evaluator(date)({})).toBe("U");
   });
+  test("ref declarations require a target and reject target metadata on other types", () => {
+    const r = app.empty();
+    r.attributes = [
+      { key: "x/missing", type: "ref" },
+      { key: "x/scalar", type: "string", target: "s", on_delete: "block" },
+    ];
+    expect(app.structure(r).map((x) => x.field)).toEqual(["attributes[0].target", "attributes[1].target", "attributes[1].on_delete"]);
+    r.attributes = [{ key: "x/link", type: "ref", target: "missing", on_delete: "clear" }];
+    r.shapes = [{ key: "s", attributes: ["x/link"], required: ["x/link"] }];
+    expect(app.check(r)).toEqual([
+      { field: "attributes[0].target", issue: "Unknown shape" },
+      { field: "shapes[0].required[0]", issue: "Required ref cannot be cleared" },
+    ]);
+    r.attributes[0] = { key: "x/link", type: "ref", target: "s" };
+    expect(app.check(r)).toEqual([]);
+    expect(app.compile(r).edges.get("x/link")).toEqual({ target: "s", on_delete: "block" });
+    expect(r.attributes[0]).not.toHaveProperty("on_delete");
+    const doc = Schema.toJsonSchemaDocument(app.compile(r).schemas.get("s")!);
+    expect(doc.schema).toMatchObject({ properties: { "x/link": { pattern: "^en_[A-Za-z0-9_-]{21}$" } } });
+  });
+  test("ref rules support exact id comparisons and presence without consulting live data", () => {
+    const r = fixture();
+    const e = entity({});
+    r.attributes.push({ key: "employee/link", type: "ref", target: "employee" });
+    r.shapes[0]!.attributes = [...r.shapes[0]!.attributes, "employee/link"];
+    for (const [operator, value] of [
+      ["equal", e.id],
+      ["notEqual", e.id],
+      ["in", [e.id]],
+      ["notIn", [e.id]],
+      ["exists", undefined],
+      ["doesNotExist", undefined],
+    ] as const) {
+      r.policies![0]!.applies_when = { fact: "employee/link", operator, ...(value === undefined ? {} : { value }) };
+      expect(app.check(r)).toEqual([]);
+    }
+    for (const [condition, field] of [
+      [{ operator: "contains", value: e.id }, "operator"],
+      [{ operator: "lessThan", value: e.id }, "operator"],
+      [{ operator: "equal", value: e.id, ignore_case: false }, "ignore_case"],
+      [{ operator: "in", value: [e.id, "not an id"] }, "value"],
+    ] as const) {
+      r.policies![0]!.applies_when = { fact: "employee/link", ...condition };
+      expect(app.check(r).map((x) => x.field)).toEqual([`policies[0].applies_when.${field}`]);
+    }
+  });
+  test("removing a target shape reports both the registry issue and dangling retained facts", () => {
+    const r: Registry = {
+      attributes: [
+        { key: "x/name", type: "string" },
+        { key: "x/link", type: "ref", target: "target" },
+      ],
+      shapes: [
+        { key: "employee", attributes: ["x/link"] },
+        { key: "target", attributes: ["x/name"] },
+      ],
+      automations: [],
+    };
+    const target = { ...entity({}), id: "en_BBBBBBBBBBBBBBBBBBBBB", shape: "target" };
+    const source = entity({ "x/link": target.id });
+    const plan = app.plan(r, { ...r, shapes: r.shapes.slice(0, 1) }, [source, target]);
+    expect(plan.issues.map((x) => x.field)).toEqual(["attributes[1].target"]);
+    expect(plan.violations).toEqual([{ entity_id: source.id, field: "facts.x/link", issue: "Dangling reference" }]);
+  });
   test("unresolved refs suppress dependent checks; issues preserve field order", () => {
     const r = fixture();
     r.automations![0]!.when = { fact: "x/missing", operator: "lessThan", value: true, ignore_case: true };
@@ -140,13 +204,22 @@ describe("registry pipeline", () => {
 
 test("generated reference completeness has an independent enumeration oracle", () => {
   fc.assert(
-    fc.property(fc.integer({ min: 1, max: 12 }), fc.nat(), (n, pick) => {
+    fc.property(fc.integer({ min: 1, max: 12 }), fc.nat(), fc.array(fc.boolean(), { minLength: 12, maxLength: 12 }), (n, pick, flags) => {
       const keys = Array.from({ length: n }, (_, i) => `x/a${i}`),
         lost = pick % n;
       const condition = (key: string) => ({ fact: key, operator: "exists" });
+      const isRef = (i: number) => i === 0 || flags[i];
+      const target = (i: number) => (i % 2 ? "odd" : "even");
       const r: Registry = {
-        attributes: keys.map((key) => ({ key, type: "string" })),
-        shapes: [{ key: "s", attributes: keys }],
+        attributes: [
+          ...keys.map((key, i) => (isRef(i) ? { key, type: "ref", target: target(i) } : { key, type: "string" })),
+          { key: "x/anchor", type: "string" },
+        ],
+        shapes: [
+          { key: "s", attributes: keys },
+          { key: "even", attributes: ["x/anchor"] },
+          { key: "odd", attributes: ["x/anchor"] },
+        ],
         policies: keys.map((key, i) => ({
           id: `p${i}`,
           name: "P",
@@ -159,11 +232,16 @@ test("generated reference completeness has an independent enumeration oracle", (
           shape: "s",
           on: { changed: [key] },
           when: condition(key),
-          do: [{ op: "set", attribute: key, value: "v" }],
+          do: [{ op: "set", attribute: key, value: isRef(i) ? entity({}).id : "v" }],
         })),
       };
       expect(app.structure(r)).toEqual([]);
       expect(app.check(r)).toEqual([]);
+      const removedShape = target(pick);
+      const without = { ...r, shapes: r.shapes.filter((s) => s.key !== removedShape) };
+      expect(app.check(without).map((x) => x.field)).toEqual(
+        keys.flatMap((_, i) => (isRef(i) && target(i) === removedShape ? [`attributes[${i}].target`] : [])),
+      );
       r.attributes!.splice(lost, 1);
       const expected = [
         `shapes[0].attributes[${lost}]`,

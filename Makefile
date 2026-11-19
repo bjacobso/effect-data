@@ -10,5 +10,6 @@ test:
 	pnpm test
 fmt:
 	pnpm exec prettier --write src migrations test conformance bench package.json tsconfig.json
+BENCH_MODE ?= refs
 bench:
-	node --max-old-space-size=8192 bench/run.ts
+	BENCH_MODE=$(BENCH_MODE) node --max-old-space-size=8192 bench/run.ts

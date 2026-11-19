@@ -30,6 +30,14 @@ beforeAll(async () => {
   app = await runtime.runPromise(Engine);
 }, 30000);
 afterAll(() => runtime.dispose());
+const block = "employee/block";
+const clear = "employee/clear";
+const withRefs = () => {
+  const r = fixture();
+  r.attributes.push({ key: block, type: "ref", target: "employee" }, { key: clear, type: "ref", target: "employee", on_delete: "clear" });
+  r.shapes[0]!.attributes = [...r.shapes[0]!.attributes, block, clear];
+  return r;
+};
 const seed = async () => {
   const a = account();
   await run(store.apply(a, "test", fixture(), 0));
@@ -37,7 +45,7 @@ const seed = async () => {
 };
 
 test("revived Arbitrary schemas: every type decodes and round-trips through real jsonb", async () => {
-  const r = fixture(),
+  const r = withRefs(),
     decoder = app.compile(r).schemas.get("employee")!;
   for (const attr of r.attributes!) {
     const schema = valueSchema(attr as Attribute);
@@ -56,25 +64,34 @@ test("revived Arbitrary schemas: every type decodes and round-trips through real
   }
 }, 30000);
 
-test("projection equals independent fact replay and as_of after random operations", async () => {
+test("projections and edges equal independent fact replay after random operations", async () => {
   await fc.assert(
     fc.asyncProperty(
       fc.array(
         fc.record({
-          op: fc.constantFrom("create", "patch", "retract", "automation", "delete"),
+          op: fc.constantFrom("create", "patch", "retract", "automation", "delete", "block", "clear", "unlink"),
           target: fc.nat(20),
           value: fc.integer({ min: -20, max: 20 }),
         }),
         { minLength: 15, maxLength: 35 },
       ),
       async (operations) => {
-        const a = await seed(),
+        const a = account(),
           model = new Map<string, Entity>(),
           snapshots: Entity[] = [],
           ids: string[] = [];
-        // Guarantee lifecycle, retraction, and automation coverage in every run; then generated operations vary order and targets.
+        await run(store.apply(a, "test", withRefs(), 0));
+        // Every run covers a blocked delete followed by a successful clear.
+        // Generated actions vary order, referrers, and targets after that prefix.
         const actions = [
           { op: "create", target: 0, value: 0 },
+          { op: "create", target: 0, value: 0 },
+          { op: "create", target: 0, value: 0 },
+          { op: "block", target: 0, value: 1 },
+          { op: "clear", target: 2, value: 1 },
+          { op: "delete", target: 1, value: 0 },
+          { op: "unlink", target: 0, value: 0 },
+          { op: "delete", target: 1, value: 0 },
           { op: "automation", target: 0, value: 1 },
           { op: "retract", target: 0, value: 0 },
           { op: "patch", target: 0, value: 2 },
@@ -84,6 +101,7 @@ test("projection equals independent fact replay and as_of after random operation
         for (const [index, action] of actions.entries()) {
           const id = ids[action.target % (ids.length || 1)],
             old = id ? model.get(id) : undefined;
+          const cleared = new Set<string>();
           if (action.op === "create" || !old) {
             const expected = { "person/email": `e${index}@test`, "employee/state": "CA" };
             const e = await run(store.mutate(a, "human", { shape: "employee", facts: expected }));
@@ -92,14 +110,47 @@ test("projection equals independent fact replay and as_of after random operation
             model.set(e.id, e);
             snapshots.push(e);
           } else if (action.op === "delete") {
-            await run(store.remove(a, "human", old.id));
-            model.delete(old.id);
-            await expect(run(store.getLive(a, old.id))).rejects.toThrow();
+            const blockers = [...model.values()].filter((e) => e.id !== old.id && e.facts[block] === old.id);
+            if (blockers.length) {
+              const error = await run(Effect.flip(store.remove(a, "human", old.id)));
+              expect(error).toMatchObject({
+                _tag: "Conflict",
+                issues: blockers
+                  .map((e) => `${e.id}.facts.${block}`)
+                  .sort()
+                  .map((field) => ({ field, issue: "Referenced" })),
+              });
+            } else {
+              await run(store.remove(a, "human", old.id));
+              model.delete(old.id);
+              await expect(run(store.getLive(a, old.id))).rejects.toThrow();
+              for (const e of model.values()) {
+                if (e.facts[clear] !== old.id) continue;
+                const facts = { ...e.facts };
+                delete facts[clear];
+                model.set(e.id, { ...e, facts });
+                cleared.add(e.id);
+              }
+            }
           } else {
-            const patch =
-              action.op === "automation"
-                ? { "employee/state": old.facts["employee/state"] === "CO" ? "CA" : "CO" }
-                : { "employee/salary": action.op === "retract" ? null : action.value };
+            const target = [...model.keys()][Math.abs(action.value) % model.size]!;
+            let patch: Record<string, string | number | null>;
+            switch (action.op) {
+              case "automation":
+                patch = { "employee/state": old.facts["employee/state"] === "CO" ? "CA" : "CO" };
+                break;
+              case "block":
+                patch = { [block]: target };
+                break;
+              case "clear":
+                patch = { [clear]: target };
+                break;
+              case "unlink":
+                patch = { [block]: null, [clear]: null };
+                break;
+              default:
+                patch = { "employee/salary": action.op === "retract" ? null : action.value };
+            }
             const expected: Facts = { ...old.facts };
             for (const [k, v] of Object.entries(patch))
               if (v === null) delete expected[k];
@@ -112,7 +163,19 @@ test("projection equals independent fact replay and as_of after random operation
           }
           const projected = await run(store.live(a));
           expect(projected.map((e) => [e.id, e.facts]).sort()).toEqual([...model.values()].map((e) => [e.id, e.facts]).sort());
+          const edges = await run(store.sql<{ entity_id: string; attribute: string; target_id: string }>`
+            SELECT entity_id,attribute,target_id FROM live_refs WHERE account_id=${a} ORDER BY entity_id COLLATE "C",attribute`);
+          expect(edges).toEqual(
+            projected
+              .toSorted((a, b) => (a.id < b.id ? -1 : 1))
+              .flatMap((e) =>
+                [block, clear].flatMap((attribute) =>
+                  e.facts[attribute] === undefined ? [] : [{ entity_id: e.id, attribute, target_id: e.facts[attribute] }],
+                ),
+              ),
+          );
           for (const e of projected) {
+            if (cleared.has(e.id)) snapshots.push(e);
             const replay: Facts = {},
               history = await run(store.history(a, e.id));
             for (const row of history.data)
