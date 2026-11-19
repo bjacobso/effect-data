@@ -38,6 +38,7 @@ OpenAPI document at `/v2/openapi.json` are public.
 `X-Actor` is optional. The contract is in [PLAN.md](PLAN.md); implementation
 results, LOC accounting, schema experience, and limitations are in
 [REPORT.md](REPORT.md).
+The current contract, kept in step with the code, is [SPEC.md](SPEC.md).
 
 `src/core/` contains pure primitives and no HTTP, SQL, or domain vocabulary.
 `src/packs/` supplies typed kinds, operations, and HttpApi groups.

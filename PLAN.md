@@ -47,6 +47,8 @@ queries later (as two more document kinds).
 - Hand-written SQL. No ORM.
 - If anything here is ambiguous or contradicts `conformance/data.mjs`, stop
   and write `QUESTIONS.md`. Never bend code to fit a test you believe is wrong.
+- **Keep SPEC.md current:** it is the system's contract as implemented.
+  Every behaviour change updates it in the same commit (see AGENTS.md).
 - **Line budget:** aim for at most **1,200 non-test lines** in `src/`. Report
   honestly if you exceed it and why.
 
@@ -626,7 +628,104 @@ lines changed against the budget, file by file; files touched outside core;
 where refs did **not** fit the kind/attribute protocol and what a generic
 primitive would have needed; results of all three conformance suites.
 
-## Pass 5: queries
+## Pass 5: find and fix the slowness
+
+Goal: explain where time goes, then remove it. Pass 4 measured a registry
+apply on 1,000,000 entities holding the **exclusive account lock for ~80 s**
+(every write to that account blocks), plus PATCH at ~1,700-3,100 writes/s and
+`as_of` growing linearly with history. Measure first; change behaviour only in
+phase B. The wire contract does not change; SPEC.md is updated only where
+guarantees or known limits change.
+
+### Phase A: investigate (no behaviour changes, own commit)
+
+Instrument and record, in REPORT.md "Pass 5 investigation", for the
+`bench_big` account:
+
+1. **Registry apply**, split into phases with wall time and SQL statement
+   count each: waiting for the lock; loading and parsing live entities;
+   `plan` reference/type checks; per-entity revalidation (schema decode);
+   per-entity staging, uniqueness and edge work; registry write; flush. Add a
+   Node CPU profile (`--cpu-prof`) of the apply and name the top frames.
+2. **PATCH**: database round trips per write and time per step (account lock,
+   entity read, decode, uniqueness, refs, clock reserve, inserts), single and
+   under 16 workers.
+3. **as_of** at 10 / 1,000 / 10,000 history rows: rows read, time in SQL vs
+   replay.
+
+Confirm or refute these hypotheses from reading the code, with evidence:
+
+- **H1:** apply calls `unique()` for **every** live entity even when nothing
+  about it changed, which issues at least one `DELETE` round trip per entity
+  (1M statements) even with no unique attributes; changed entities pay it
+  twice (`stage` and the apply loop).
+- **H2:** `plan` decodes every live entity through Effect Schema in-process,
+  and that decode is a large CPU share.
+- **H3:** loading all live documents into memory is a material time and
+  memory cost (report peak RSS).
+- **H4:** all of the above runs inside the exclusive lock in one transaction,
+  so lock time is roughly total apply time.
+
+Add two apply scenarios to `make bench` alongside the existing one
+(attach an optional attribute): **remove a populated attribute** from the
+shape (1M migration retractions), and **make an attribute unique** whose
+values are already distinct. For every scenario also measure **PATCH p50/p99
+for writes to the same account issued while the apply runs**: that is the
+user-visible cost of the lock.
+
+### Phase B: fix, in this order, measuring after each step
+
+Rerun the bench after each step and record a row per step per scenario.
+
+1. **Skip no-op work.** An entity whose retained facts, unique slots and
+   edges do not change under the desired registry writes nothing: no
+   `live_unique` churn, no edge work, no event. Fix the double `unique()`.
+2. **Classify changes before revalidating.** Compute from the registry diff
+   which entities can possibly violate the desired registry. Changes that
+   cannot (adding an attribute, adding an optional attribute to a shape,
+   labels, adding or editing policies, automations and other non-attribute
+   kinds) skip per-entity revalidation entirely. Revalidate only the shapes
+   and attributes affected by: new required members, type or `values`
+   changes, becoming unique, ref target or `on_delete` changes, attributes
+   leaving a shape, and removed shapes. Use indexed SQL where it is exact
+   (e.g. "any live entity lacks attribute X", "duplicate values of X") instead
+   of loading documents.
+   - **Differential property test (required):** for generated registry pairs
+     and live entities, the classified plan's `violations` equal the
+     full-revalidation plan's, always.
+3. **Shorten the lock for expensive changes.** When revalidation or
+   retractions are needed, do the scanning and validation in batches **before**
+   taking the exclusive lock, against a recorded tx position. Under the
+   exclusive lock, recheck only entities written after that position, then
+   write. If the retraction writes themselves still hold the lock for long,
+   report the number and stop there: fully online migration is a later pass.
+
+Targets (report against them; missing one is allowed with an explanation):
+attach-optional apply holds the exclusive lock **< 100 ms** at 1M entities;
+make-unique **< 5 s**; remove-populated reports its lock time honestly.
+
+### Phase C: PATCH and as_of (only if cheap)
+
+From phase A's numbers, fix the largest single PATCH cost if it does not
+change semantics (e.g. collapsing round trips). Do not change `as_of`
+storage in this pass; record the recommended change (checkpoints or an
+`(account, entity, tx)` latest-value read) with its expected effect.
+
+### Constraints for this pass
+
+- Plan/apply semantics, issues, violations and ordering are unchanged; every
+  existing test and conformance suite stays green.
+- Core changes are allowed in `plan` (classification is pure and belongs in
+  core); keep storage free of attribute-type knowledge, as in Pass 4.
+- Update SPEC.md section 9's known limits with the new measured numbers.
+
+### REPORT.md "Pass 5" section
+
+The investigation table and verdict on H1-H4; per-step before/after numbers
+for all three apply scenarios and the concurrent-PATCH impact; lines changed
+by layer; what remains slow and what the next change would be.
+
+## Deferred: queries (formerly planned as Pass 5)
 
 Goal: a query is **another document kind** checked by the existing reference
 and typed-rule machinery, compiled to SQL with the inherited three-valued
@@ -701,5 +800,5 @@ kind are counted separately). Report every overrun.
 
 The storage decision and its cost; kind-protocol fit, file by file; the
 differential test's case count and anything it found; query latency on the
-Pass 4 benchmark data with and without the cell indexes (add to `make bench`);
+benchmark data with and without the cell indexes (add to `make bench`);
 results of all conformance suites including a new `conformance/data-queries.ts`.
