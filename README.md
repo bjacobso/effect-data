@@ -65,3 +65,17 @@ With the default packs running, also verify:
 ```sh
 BASE_URL=http://localhost:8086 node conformance/data-certs.ts
 ```
+
+The Pass 4 benchmark invokes the Store directly. Create the dedicated
+`onb_data_bench` database once and run the matched ref workload with:
+
+```sh
+createdb -h localhost onb_data_bench
+BENCH_MODE=refs make bench
+```
+
+Use `BENCH_DATABASE_URL` to override the connection URL. Each run recreates
+its own benchmark schema in that database and writes `bench/results-refs.json`.
+Run `make bench` at the baseline commit to reproduce `bench/results-baseline.json`.
+`BENCH_ENTITIES` and `BENCH_WRITES` override the one-million-entity and
+250-writes-per-worker defaults for a smoke run, which writes a separate result.

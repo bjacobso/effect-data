@@ -6,7 +6,7 @@
     "migrate": "node src/migrate.ts",
     "start": "node src/main.ts",
     "test": "tsc --noEmit && vitest run",
-    "fmt": "prettier --write src migrations test conformance package.json tsconfig.json && tsc --noEmit"
+    "fmt": "prettier --write src migrations test conformance bench package.json tsconfig.json && tsc --noEmit"
   },
   "dependencies": {
     "@effect/platform-node": "4.1.3",
