@@ -24,7 +24,7 @@ Create `onb_data` and `onb_data_test` once with `createdb`, then:
 make deps migrate test
 make run
 # In another terminal:
-BASE_URL=http://localhost:8086 node conformance/data.mjs
+BASE_URL=http://localhost:8086 node conformance/data.ts
 ```
 
 `PORT` defaults to 8086. `DATABASE_URL` defaults to
@@ -63,5 +63,5 @@ and `POST /v2/entities/{id}/certifications` with `{ "on": "YYYY-MM-DD" }`.
 With the default packs running, also verify:
 
 ```sh
-BASE_URL=http://localhost:8086 node conformance/data-certs.mjs
+BASE_URL=http://localhost:8086 node conformance/data-certs.ts
 ```

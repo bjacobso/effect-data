@@ -9,4 +9,4 @@ run:
 test:
 	pnpm test
 fmt:
-	pnpm exec prettier --write src migrations test package.json tsconfig.json
+	pnpm exec prettier --write src migrations test conformance package.json tsconfig.json

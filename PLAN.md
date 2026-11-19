@@ -1,7 +1,7 @@
 # effect-data: Clojure's philosophy, Effect-native (minimal POC)
 
 > This is the working plan given to a coding agent, kept as written across
-> three passes. References to `../PLAN.md` and `../effect-ts` point into the
+> several passes. References to `../PLAN.md` and `../effect-ts` point into the
 > exploration this started in; the parts that matter are restated in
 > [docs/inherited-contract.md](docs/inherited-contract.md).
 
@@ -460,3 +460,246 @@ Lines in the certification pack; every file touched outside it and why; the
 primitives (anything a third pack would want in core — e.g. date math,
 per-pack routes needing request bodies); results of `data.mjs` under both
 `PACKS` settings and `data-certs.mjs`.
+
+## Pass 4: housekeeping, a baseline benchmark, and refs between entities
+
+Goal: test the claim that a new capability is a small, generic addition, using
+the hardest case so far. Every earlier kind was configuration beside the data;
+a ref changes the data itself (integrity on write, behavior on delete, impact
+that follows edges). Refs are honestly a **core primitive** (a new attribute
+type), not a pack, so this pass has an explicit core-change budget and the
+report measures against it. Keep every existing test and both conformance
+suites green.
+
+### 0. Housekeeping (land first, in its own commit)
+
+- Convert `conformance/data.mjs` and `conformance/data-certs.mjs` to
+  TypeScript programs that are **Effect end to end**: `HttpClient` for
+  requests, `Schema` to decode every response body, typed errors for failed
+  expectations, `Effect.gen` for each case, `NodeRuntime.runMain` as the
+  entry point, run with `node`. Same cases, same assertions, same `BASE_URL`
+  contract.
+- Write them as an **external user of the API would, from first
+  principles**: they import nothing from `src/` (still black-box) and define
+  their own response schemas from the wire contract in this plan. They double
+  as the example of how to consume this service with Effect, so favour
+  readable, idiomatic code over clever helpers: a reader new to the
+  repo should learn the API from them.
+- `LICENSE` is MIT (already added).
+- Update the README commands accordingly.
+
+### 1. Baseline benchmark (before any refs code)
+
+`bench/` holds a script that generates one account (`bench_big`) with
+**200 attributes** in the registry, **199 of them** in one shape, mixed
+types, and **1,000,000 entities**, plus 100 small accounts. One of the 199
+is a `string` attribute `bench/link` holding the id of another entity (see
+the matched workload below). It measures and writes
+`bench/results-baseline.json`:
+
+- write throughput: N concurrent PATCH workers on one busy account vs the
+  same N spread over the 100 accounts (p50/p95/p99, writes/s);
+- registry apply on `bench_big` that attaches the 200th attribute to the
+  shape as **optional** (no retractions, but every live entity is
+  revalidated): wall time and how long the exclusive account lock is held;
+- `as_of` latency for entities with 10, 1,000 and 10,000 history rows.
+
+The PATCH workload sets `bench/link` to the id of another live entity.
+In the refs run, `bench/link` is declared as
+`{type: "ref", target: <the shape>}` instead of `string`; everything else,
+including the payloads and entity ids patched, is identical. That isolates
+the cost of ref validation and edge maintenance.
+
+Drive the Store directly or over HTTP (say which). It does not need to be
+fast to generate; it must be repeatable (`make bench`). Rerun the same script
+at the end of Pass 4 into `bench/results-refs.json`, so the write-path cost
+of refs is a measured before/after, not a guess.
+
+### 2. The ref attribute type
+
+```json
+{ "key": "employee/manager", "type": "ref", "target": "employee", "on_delete": "block" }
+```
+
+- `target` is a shape key and is a **reference** (`{path: "target", to:
+  "shape"}`) resolved by the existing reference checker. Unknown target → one
+  issue at `attributes[i].target`.
+- `on_delete` is `block | clear`; absent means `block` and is omitted on
+  output (no inserted defaults).
+- For `ref`, `target` is **required** and `on_delete` is **optional**. Both
+  are **forbidden** on every other type (checked in `structure`, like
+  `values`).
+- A `clear` ref that is in any shape's `required` list → one issue at
+  `shapes[i].required[j]` ("Required ref cannot be cleared").
+- Value encoding: an entity id string matching `^en_[A-Za-z0-9_-]{21}$`
+  (the existing id format). A self-reference is allowed.
+- `unique: true` on a ref is allowed (one-to-one) and uses the existing
+  mechanism unchanged.
+- Rules: conditions on a ref attribute allow only `equal`, `notEqual`, `in`,
+  `notIn`, `exists`, `doesNotExist`; operands must match the id pattern;
+  `ignore_case` is not allowed. No liveness check on operands. Paths through
+  refs (`employee/manager → person/email`) are **out of scope**.
+- `set` actions may set a ref; the value is checked like a PATCH.
+
+### 3. Integrity on write
+
+- On create, PATCH and automation `set`, every ref value must name a **live
+  entity whose shape is the attribute's `target`**, in the same account.
+  Otherwise 422 at `facts.<key>` with issue `"Unknown reference"` (an
+  automation `set` failing this fails the whole request with 422).
+- This must be race-free against a concurrent DELETE of the target: the writer
+  locks each referenced target row (e.g. `FOR KEY SHARE`) inside its
+  transaction; DELETE already locks the entity `FOR UPDATE`. Do not take an
+  exclusive account lock for either.
+- Maintain a live edge table `live_refs(account_id, entity_id, attribute,
+  target_id)` with an index on `(account_id, target_id)`, updated in the write
+  transaction exactly like `live_unique`. Edges are a projection; the facts log
+  stays the source of truth.
+
+### 4. Delete
+
+`DELETE /v2/entities/{id}`, in one database transaction:
+
+1. If any **other** live entity references it through a `block` ref →
+   409 `conflict`, `details` `[{field: "<referrer_id>.facts.<attribute>",
+   issue: "Referenced"}]` sorted by referrer id then attribute. Nothing is
+   written. Self-references never block.
+2. Otherwise delete it, then for each referrer through a `clear` ref (sorted by
+   referrer id), retract that fact in its own later `tx` with reason
+   **`reference`** and actor `reference:<deleted_id>`. This needs a migration
+   widening the `facts.reason` check; history must show these rows.
+3. Cascade retractions never trigger automations (same depth-1 rule as
+   automation `set`s) and never delete anything further. There is no
+   cascade-delete option.
+
+### 5. Impact
+
+- `GET /v2/entities/{id}/referrers` →
+  `{data: [{entity_id, attribute, on_delete}]}` for live referrers, sorted by
+  entity_id then attribute. 404 for an unknown or deleted entity. This is what
+  a client uses to preview a delete.
+- Registry plan/apply: every live ref value must still point at a live entity
+  of the desired `target` shape. Changing an attribute's `type` to `ref`,
+  changing `target`, or removing the target shape's entities' eligibility
+  yields violations at `facts.<key>` ("Dangling reference"). Retargeting is
+  allowed when no live value breaks.
+- `as_of` returns ref values as they were, even if the target has since been
+  deleted; history is not rewritten.
+
+### 6. Core-change budget (measured in REPORT.md)
+
+- Core may change only `model.ts`, `values.ts`, `kinds.ts`, `rules.ts` and
+  `engine.ts`. The literal `"ref"` may appear only in `values.ts`, `kinds.ts`
+  and `rules.ts`.
+- `compile` gains one generic output, `edges: Map<attribute, {target,
+  on_delete}>` (or equivalent), and storage consumes **only that**. Storage
+  must not inspect attribute types.
+- Target: **≤ 80 net lines in `src/core/`**. Exceeding it is allowed; report
+  exactly where and why. That is the result we want.
+- List every file touched outside `src/core/` and why, as in Pass 3.
+
+### 7. Tests and conformance
+
+- Unit: ref structure/reference issues (unknown target, `target` on a
+  non-ref, clear+required), rule operator checks for refs.
+- Property: extend property 2 (reference completeness) so generated
+  registries include ref attributes and deleting a shape predicts the
+  `target` issues exactly; extend property 3 (projection = fold(facts)) with
+  ref writes, blocked deletes and clear cascades, and add **edges =
+  fold(facts)**: `live_refs` always equals the edges recomputed from live
+  projections.
+- Concurrency: a create referencing X racing DELETE of X gives exactly one
+  of {201 then 409 on delete, 204 then 422 on create}, never a dangling edge
+  (repeat 50×).
+- New black-box suite `conformance/data-refs.ts`, in the same style as the converted suites, covering at least:
+  create with valid/unknown/wrong-shape/deleted target; PATCH to retarget and
+  to null; self-reference; block delete with ordered details; clear delete
+  with history rows and reason `reference`; clear does not fire automations;
+  referrers listing; `as_of` before and after a clear; registry plan
+  violations for retargeting; a `unique` ref; automation `set` of a bad ref
+  failing the request.
+
+### REPORT.md "Pass 4" section
+
+Housekeeping results; baseline vs refs benchmark numbers side by side; core
+lines changed against the budget, file by file; files touched outside core;
+where refs did **not** fit the kind/attribute protocol and what a generic
+primitive would have needed; results of all three conformance suites.
+
+## Pass 5: queries
+
+Goal: a query is **another document kind** checked by the existing reference
+and typed-rule machinery, compiled to SQL with the inherited three-valued
+semantics intact. Decide storage first; the kind protocol is judged
+separately from the storage change.
+
+### 1. Storage decision (do this first, report it separately)
+
+Today `facts.value` is jsonb holding a JSON **string** of canonical JSON (to
+preserve NUL and lone surrogates), and `entities.document` is text. Neither is
+queryable by type. Add a live typed projection maintained in the write
+transaction like `live_unique`:
+
+    cells(account_id, entity_id, shape, attribute,
+          s text COLLATE "C", n numeric, b boolean, d date)
+
+one row per present live fact, exactly one typed column set (`enum`, `string`
+and `ref` use `s`; `integer`/`number` use `n`). An absent fact is an absent
+row. Index `(account_id, attribute, s|n|b|d, entity_id)` per column. Strings
+containing NUL cannot live in `text`: either reject NUL in string attributes
+from now on (registry-level decision, report it) or store such cells with a
+flag and evaluate them in memory. Say which and why. Facts and history are
+unchanged.
+
+### 2. The query kind (core)
+
+```json
+{ "id": "co-drivers", "shape": "employee",
+  "where": { "all": [ { "fact": "employee/work_state", "operator": "equal", "value": "CO" },
+                      { "fact": "employee/role", "operator": "equal", "value": "driver" } ] },
+  "order_by": [ { "attribute": "employee/salary", "direction": "desc" } ] }
+```
+
+Collection `queries`, order 45. `where` is a Rule checked exactly like policy
+rules; `order_by` (0–3 items) attributes must be in the shape and not `ref`.
+Field order: `id, shape, where, order_by`.
+
+### 3. Running
+
+- `POST /v2/queries/{id}/run` and `POST /v2/query` (an inline query document,
+  checked with the same kind checks; issues → 422) take
+  `{limit?: 1..200 (50), after?: <cursor>, match?: "true" | "unknown"}` and
+  return `{data: [entity], next_after}`. `match: "true"` returns entities
+  where `where` is T; `"unknown"` returns those where it is U. F never.
+- Order: `order_by` then entity id; absent values sort last in either
+  direction. Keyset cursor, opaque string.
+- Live data only. `as_of` queries are out of scope.
+
+### 4. Compiling rules to SQL
+
+One compiler `rule → SQL boolean expression` where SQL `NULL` is U:
+SQL's `AND`/`OR`/`NOT` over `NULL` match the inherited `all`/`any`/`not`
+tables; empty `all` → `TRUE`, empty `any` → `FALSE`; a condition on an absent
+cell → `NULL` except `exists`/`doesNotExist`. Specify exactly how
+`ignore_case` lowercases (Postgres `lower` vs JS `toLowerCase` differ outside
+ASCII) and make the in-memory evaluator agree.
+
+**Differential property test (the core of this pass):** for generated
+registries, entities and rules, the SQL result (T/F/U per entity, via
+`match`) equals the existing in-memory evaluator on every entity. Include
+absent facts, `in`/`notIn` with absent facts, `ignore_case` on non-ASCII,
+numeric boundaries, dates, and depth-20 rules.
+
+### 5. Core-change budget
+
+The query kind lives in core (it is generic). The SQL compiler lives in
+`src/storage/` and consumes rules plus compiled attribute metadata only.
+Target **≤ 60 net lines** of change in existing core files (new files for the
+kind are counted separately). Report every overrun.
+
+### REPORT.md "Pass 5" section
+
+The storage decision and its cost; kind-protocol fit, file by file; the
+differential test's case count and anything it found; query latency on the
+Pass 4 benchmark data with and without the cell indexes (add to `make bench`);
+results of all conformance suites including a new `conformance/data-queries.ts`.
