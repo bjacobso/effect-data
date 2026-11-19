@@ -360,6 +360,55 @@ test("history and as_of remain independent of a damaged projection", async () =>
   expect((await run(store.history(a, entity.id))).data.find((x) => x.attribute === "person/email")?.value).toBe("source-of-truth");
 });
 
+test("apply commits migration retractions across PostgreSQL bind batches", async () => {
+  const a = account(),
+    attribute = "batch/value",
+    initial = {
+      attributes: [
+        { key: attribute, type: "integer" },
+        { key: "batch/keep", type: "string" },
+      ],
+      shapes: [{ key: "batch", attributes: [attribute, "batch/keep"] }],
+      automations: [],
+    };
+  const count = 10_000;
+  await run(store.apply(a, "test", initial, 0));
+  const sql = store.sql;
+  await run(
+    sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO events(account_id,entity_id,tx,at,kind,shape,version,registry_version,created_at)
+      SELECT ${a},'en_' || lpad(n::text,21,'0'),n,at,'create','batch',1,1,at
+      FROM generate_series(1,${count}::integer) n
+      CROSS JOIN LATERAL (SELECT to_char(timestamp '2024-01-01' + n * interval '1 millisecond',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at) t`;
+        yield* sql`INSERT INTO facts(account_id,entity_id,tx,at,attribute,op,value,reason,actor)
+      SELECT account_id,entity_id,tx,at,${attribute},'assert',to_jsonb(tx::text),'api','test'
+      FROM events WHERE account_id=${a}`;
+        yield* sql`INSERT INTO entities(account_id,id,document)
+      SELECT account_id,entity_id,jsonb_build_object('id',entity_id,'shape',shape,'version',version,
+        'registry_version',registry_version,'created_at',created_at,'updated_at',at,
+        'facts',jsonb_build_object(${attribute}::text,tx))::text FROM events WHERE account_id=${a}`;
+        yield* sql`INSERT INTO account_clocks VALUES (${a},${count},${Date.UTC(2024, 0, 1) + count})`;
+      }),
+    ),
+  );
+
+  const applied = await run(store.apply(a, "admin", { ...initial, shapes: [{ key: "batch", attributes: ["batch/keep"] }] }, 1));
+  expect(applied.version).toBe(2);
+  const entities = await run(store.live(a));
+  expect(entities).toHaveLength(count);
+  expect(entities.every((e) => e.registry_version === 2 && e.version === 2 && Object.keys(e.facts).length === 0)).toBe(true);
+  const [migration] = await run(sql<{ count: string }>`SELECT count(*)::text FROM facts WHERE account_id=${a} AND reason='migration'`);
+  expect(Number(migration!.count)).toBe(count);
+  for (const e of [entities[0]!, entities.at(-1)!]) {
+    const [created, retracted] = (await run(store.history(a, e.id))).data;
+    expect(retracted).toMatchObject({ op: "retract", attribute, value: created!.value, actor: "admin", reason: "migration" });
+    expect((await run(store.asOf(a, e.id, created!.at))).facts).toEqual({ [attribute]: created!.value });
+    expect(await run(store.asOf(a, e.id, retracted!.at))).toEqual(e);
+  }
+}, 30000);
+
 test("a replacement store continues the database clock", async () => {
   const a = await seed();
   const first = await run(store.mutate(a, "test", { shape: "employee", facts: { "person/email": "before-restart" } }));

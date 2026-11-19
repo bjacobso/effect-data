@@ -751,3 +751,15 @@ cascade work.
 | `bench/run.ts`, `bench/results-baseline.json`, `bench/results-refs.json` | Deterministic fixture, Store workloads and measured outputs. |
 | `Makefile`, `package.json`, `tsconfig.json`, `.gitignore` | Wire benchmark, format and type-check commands, and ignore smoke outputs. |
 | `REPORT.md` | Record the measured comparison and verification. |
+
+## Pass 5
+
+### Bulk-insert regression
+
+Pass 5 found that `flush` sent all staged rows for a table in one statement.
+A registry apply retracting a populated attribute from 10,000 entities
+exceeded PostgreSQL's 65,535 bind-parameter limit and rolled back. Events,
+facts, entity projections and outbox rows now use bounded inserts inside the
+original transaction. The storage regression checks all 10,000 committed
+retractions and verifies that history and `as_of` replay across batch
+boundaries.

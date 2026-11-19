@@ -637,6 +637,18 @@ apply on 1,000,000 entities holding the **exclusive account lock for ~80 s**
 phase B. The wire contract does not change; SPEC.md is updated only where
 guarantees or known limits change.
 
+### Phase 0: bulk-insert bug fix (own commit, before phase A)
+
+`flush` inserts all events (and facts, projections, outbox rows) in one
+statement, so any write staging more rows than PostgreSQL's 65,535 bind
+parameters allow fails and rolls back: today a registry apply that retracts
+from more than ~7,281 entities cannot commit. Chunk every bulk insert in
+`flush` below the parameter limit, inside the same transaction. This restores
+the contract SPEC.md already states; it changes no semantics. Add a storage
+regression test whose apply retracts an attribute from more entities than one
+statement can hold (e.g. 10,000) and commits, with replay/as_of still
+matching. Record it in REPORT.md as a bug found by Pass 5.
+
 ### Phase A: investigate (no behaviour changes, own commit)
 
 Instrument and record, in REPORT.md "Pass 5 investigation", for the

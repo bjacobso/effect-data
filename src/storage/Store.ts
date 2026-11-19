@@ -53,7 +53,14 @@ export const makeStore = (hashOverride?: string) =>
           schedule: Schedule.jittered(Schedule.exponential("10 millis")),
         }),
       );
-    const nonempty = <A>(rows: A[]): [A, ...A[]] => [rows[0]!, ...rows.slice(1)];
+    function* insertBatches<A extends Record<string, unknown>>(rows: A[]) {
+      if (!rows.length) return;
+      const size = Math.floor(65_534 / Object.keys(rows[0]!).length);
+      for (let i = 0; i < rows.length; i += size) {
+        const [first, ...rest] = rows.slice(i, i + size);
+        yield sql.insert([first!, ...rest]);
+      }
+    }
     const cache = new Map<string, Compiled>();
     const compiled = (account: string, version: number, registry: Registry) => {
       const key = canonical([account, version]);
@@ -176,17 +183,24 @@ export const makeStore = (hashOverride?: string) =>
             actor: s.actor,
           })),
         );
-        yield* sql`INSERT INTO events ${sql.insert(nonempty(events))}`;
-        if (facts.length) yield* sql`INSERT INTO facts ${sql.insert(nonempty(facts))}`;
+        for (const batch of insertBatches(events)) yield* sql`INSERT INTO events ${batch}`;
+        for (const batch of insertBatches(facts)) yield* sql`INSERT INTO facts ${batch}`;
         const rows = [...projections.values()].map((e) => ({
           account_id: account,
           id: e.id,
           document: JSON.stringify(e),
           deleted: steps.findLast((s) => s.entity.id === e.id)!.kind === "delete",
         }));
-        yield* sql`INSERT INTO entities ${sql.insert(nonempty(rows))} ON CONFLICT(account_id,id) DO UPDATE SET document=EXCLUDED.document,deleted=EXCLUDED.deleted`;
-        if (deliveries.length)
-          yield* sql`INSERT INTO outbox ${sql.insert(nonempty(deliveries.map((d) => ({ account_id: account, at: events[d.index]!.at, entity_id: d.entity_id, automation_id: d.automation_id, document: JSON.stringify(d.action) }))))}`;
+        for (const batch of insertBatches(rows))
+          yield* sql`INSERT INTO entities ${batch} ON CONFLICT(account_id,id) DO UPDATE SET document=EXCLUDED.document,deleted=EXCLUDED.deleted`;
+        const outboxRows = deliveries.map((d) => ({
+          account_id: account,
+          at: events[d.index]!.at,
+          entity_id: d.entity_id,
+          automation_id: d.automation_id,
+          document: JSON.stringify(d.action),
+        }));
+        for (const batch of insertBatches(outboxRows)) yield* sql`INSERT INTO outbox ${batch}`;
         return projections;
       });
     const validate = (c: Compiled, shape: string, facts: Facts) => {
