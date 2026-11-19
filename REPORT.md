@@ -867,3 +867,27 @@ decoding. Each latency used 30 samples.
 | 10 | 14 | 0.245 | 0.004 | 0.233 / 0.419 |
 | 1,000 | 1,994 | 1.592 | 0.079 | 1.638 / 2.645 |
 | 10,000 | 19,994 | 12.784 | 0.703 | 13.205 / 14.635 |
+
+### Apply fixes at one million live entities
+
+Each result includes 16 concurrent PATCH samples to the apply account.
+Fix runs used the same fixture with a different account key and schema so
+their database-wide advisory locks were independent of the investigation.
+The timings are individual local runs. The investigation used `--cpu-prof`.
+
+| Step | Apply | Wall s | Exclusive lock s | PATCH p50 / p99 ms |
+| --- | --- | ---: | ---: | ---: |
+| A | Attach optional | 83.721 | 83.720 | 83,750.67 / 83,757.43 |
+| A | Make unique (rollback) | 28.130 | 28.129 | 28,135.15 / 28,141.13 |
+| B1 | Attach optional | 21.494 | 21.493 | 21,516.32 / 21,527.29 |
+| B1 | Make unique | 273.190 | 273.189 | 273,228.11 / 273,236.29 |
+| B1 | Remove populated | 150.206 | 150.206 | 151,912.29 / 151,986.39 |
+
+B1 leaves the uniqueness slots of unchanged entities untouched. Registry
+apply already excludes writers to its account, so newly unique values can
+be interned without taking individual advisory locks. The 30,000-entity
+regression verifies that enabling uniqueness commits and that subsequent
+duplicate writes fail. Attach's staging went from one million statements to
+zero. Make-unique committed with four statements per added slot. For removal
+the linear projection assembly eliminated the repeated step lookup, then
+flush took 125.27 s across 338 bulk inserts. [B1 measurements](bench/results-pass5-b1.json)

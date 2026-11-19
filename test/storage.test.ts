@@ -360,7 +360,7 @@ test("history and as_of remain independent of a damaged projection", async () =>
   expect((await run(store.history(a, entity.id))).data.find((x) => x.attribute === "person/email")?.value).toBe("source-of-truth");
 });
 
-test("apply commits migration retractions across PostgreSQL bind batches", async () => {
+const seedDistinctBatch = async (count: number) => {
   const a = account(),
     attribute = "batch/value",
     initial = {
@@ -371,7 +371,6 @@ test("apply commits migration retractions across PostgreSQL bind batches", async
       shapes: [{ key: "batch", attributes: [attribute, "batch/keep"] }],
       automations: [],
     };
-  const count = 10_000;
   await run(store.apply(a, "test", initial, 0));
   const sql = store.sql;
   await run(
@@ -394,12 +393,20 @@ test("apply commits migration retractions across PostgreSQL bind batches", async
     ),
   );
 
+  return { a, initial, attribute };
+};
+
+test("apply commits migration retractions across PostgreSQL bind batches", async () => {
+  const count = 10_000;
+  const { a, initial, attribute } = await seedDistinctBatch(count);
   const applied = await run(store.apply(a, "admin", { ...initial, shapes: [{ key: "batch", attributes: ["batch/keep"] }] }, 1));
   expect(applied.version).toBe(2);
   const entities = await run(store.live(a));
   expect(entities).toHaveLength(count);
   expect(entities.every((e) => e.registry_version === 2 && e.version === 2 && Object.keys(e.facts).length === 0)).toBe(true);
-  const [migration] = await run(sql<{ count: string }>`SELECT count(*)::text FROM facts WHERE account_id=${a} AND reason='migration'`);
+  const [migration] = await run(
+    store.sql<{ count: string }>`SELECT count(*)::text FROM facts WHERE account_id=${a} AND reason='migration'`,
+  );
   expect(Number(migration!.count)).toBe(count);
   for (const e of [entities[0]!, entities.at(-1)!]) {
     const [created, retracted] = (await run(store.history(a, e.id))).data;
@@ -407,6 +414,20 @@ test("apply commits migration retractions across PostgreSQL bind batches", async
     expect((await run(store.asOf(a, e.id, created!.at))).facts).toEqual({ [attribute]: created!.value });
     expect(await run(store.asOf(a, e.id, retracted!.at))).toEqual(e);
   }
+}, 30000);
+
+test("apply enables uniqueness beyond the shared advisory lock table without writing migration events", async () => {
+  const count = 30_000;
+  const { a, initial, attribute } = await seedDistinctBatch(count);
+  const desired = { ...initial, attributes: initial.attributes.map((attr) => (attr.key === attribute ? { ...attr, unique: true } : attr)) };
+  expect((await run(store.apply(a, "admin", desired, 1))).version).toBe(2);
+  const sql = store.sql;
+  const [counts] = await run(sql<{ slots: string; events: string }>`SELECT
+    (SELECT count(*) FROM live_unique WHERE account_id=${a})::text AS slots,
+    (SELECT count(*) FROM events WHERE account_id=${a})::text AS events`);
+  expect(counts).toMatchObject({ slots: String(count), events: String(count) });
+  const duplicate = await run(Effect.flip(store.mutate(a, "test", { shape: "batch", facts: { [attribute]: count } })));
+  expect(duplicate).toMatchObject({ _tag: "Conflict", issues: [{ field: `facts.${attribute}`, issue: "Duplicate unique value" }] });
 }, 30000);
 
 test("a replacement store continues the database clock", async () => {

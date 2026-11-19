@@ -104,30 +104,26 @@ export const makeStore = (hashOverride?: string) =>
         if (!rows[0]) return yield* Effect.fail(new NotFound());
         return JSON.parse(rows[0].document) as Entity;
       });
-    const unique = (account: string, entity: Entity, registry: Registry) =>
+    const insertUnique = (account: string, id: string, key: string, value: Value, exclusive: boolean) =>
       Effect.gen(function* () {
-        yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${entity.id}`;
-        for (const [key, value] of Object.entries(entity.facts).sort(([a], [b]) => compare(a, b)))
-          if (findAttribute(registry, key)?.unique) {
-            const encoded = encodeValue(value);
-            const hashes = yield* sql<{ hash: string }>`SELECT coalesce(${hashOverride ?? null},md5(${encoded}::jsonb::text)) AS hash`;
-            const hash = hashes[0]!.hash;
-            yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${canonical([account, key, hash])},1))`;
-            const existing = yield* sql<{
-              id: string;
-            }>`SELECT id::text FROM unique_values WHERE account_id=${account} AND attribute=${key} AND hash=${hash} AND value=${encoded}::jsonb`;
-            const valueId =
-              existing[0]?.id ??
-              (yield* sql<{
-                id: string;
-              }>`INSERT INTO unique_values(account_id,attribute,hash,value) VALUES (${account},${key},${hash},${encoded}::jsonb) RETURNING id::text`)[0]!
-                .id;
-            yield* sql`INSERT INTO live_unique(account_id,entity_id,attribute,value,value_id) VALUES (${account},${entity.id},${key},${encoded}::jsonb,${valueId})`.pipe(
-              Effect.mapError((e) =>
-                e.reason._tag === "UniqueViolation" ? new Conflict({ issues: [issue(`facts.${key}`, "Duplicate unique value")] }) : e,
-              ),
-            );
-          }
+        const encoded = encodeValue(value);
+        const hashes = yield* sql<{ hash: string }>`SELECT coalesce(${hashOverride ?? null},md5(${encoded}::jsonb::text)) AS hash`;
+        const hash = hashes[0]!.hash;
+        if (!exclusive) yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${canonical([account, key, hash])},1))`;
+        const existing = yield* sql<{
+          id: string;
+        }>`SELECT id::text FROM unique_values WHERE account_id=${account} AND attribute=${key} AND hash=${hash} AND value=${encoded}::jsonb`;
+        const valueId =
+          existing[0]?.id ??
+          (yield* sql<{
+            id: string;
+          }>`INSERT INTO unique_values(account_id,attribute,hash,value) VALUES (${account},${key},${hash},${encoded}::jsonb) RETURNING id::text`)[0]!
+            .id;
+        yield* sql`INSERT INTO live_unique(account_id,entity_id,attribute,value,value_id) VALUES (${account},${id},${key},${encoded}::jsonb,${valueId})`.pipe(
+          Effect.mapError((e) =>
+            e.reason._tag === "UniqueViolation" ? new Conflict({ issues: [issue(`facts.${key}`, "Duplicate unique value")] }) : e,
+          ),
+        );
       });
     const stage = (
       steps: Step[],
@@ -148,8 +144,12 @@ export const makeStore = (hashOverride?: string) =>
         const next = { ...entity, version: (before?.version ?? 0) + 1, created_at: before?.created_at ?? "" };
         const probe = reason === "migration" ? undefined : yield* StoreProbe;
         probe?.phase("uniqueness");
-        if (kind === "delete") yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
-        else yield* unique(account, next, registry);
+        if (reason !== "migration") {
+          yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${next.id}`;
+          if (kind !== "delete")
+            for (const [key, value] of Object.entries(next.facts).sort(([a], [b]) => compare(a, b)))
+              if (findAttribute(registry, key)?.unique) yield* insertUnique(account, next.id, key, value, false);
+        }
         probe?.phase("edge update");
         if (edges.size) yield* refs.update(account, next, keys, edges);
         probe?.phase("staging and automations");
@@ -165,10 +165,13 @@ export const makeStore = (hashOverride?: string) =>
         probe?.phase("clock reserve");
         const allocation = yield* clock.reserve(account, steps.length);
         probe?.phase("flush inserts and assembly");
+        const deleted = new Set<string>();
         const events = steps.map((s, i) => {
           const at = new Date(allocation.ms + i + 1).toISOString(),
             created_at = s.entity.created_at || projections.get(s.entity.id)?.created_at || at;
           projections.set(s.entity.id, { ...s.entity, created_at, updated_at: at });
+          if (s.kind === "delete") deleted.add(s.entity.id);
+          else deleted.delete(s.entity.id);
           return {
             account_id: account,
             entity_id: s.entity.id,
@@ -200,7 +203,7 @@ export const makeStore = (hashOverride?: string) =>
           account_id: account,
           id: e.id,
           document: JSON.stringify(e),
-          deleted: steps.findLast((s) => s.entity.id === e.id)!.kind === "delete",
+          deleted: deleted.has(e.id),
         }));
         for (const batch of insertBatches(rows))
           yield* sql`INSERT INTO entities ${batch} ON CONFLICT(account_id,id) DO UPDATE SET document=EXCLUDED.document,deleted=EXCLUDED.deleted`;
@@ -303,18 +306,35 @@ export const makeStore = (hashOverride?: string) =>
           const previous = compiled(account, current.version, current.registry).edges;
           // The desired version is not committed yet, so keep it out of the cache.
           const edges = app.compile(desired).edges;
+          const previousUnique = new Set(current.registry.attributes.filter((a) => a.unique).map((a) => a.key));
+          const desiredUnique = new Set(desired.attributes.filter((a) => a.unique).map((a) => a.key));
+          const addedUnique = [...desiredUnique].filter((key) => !previousUnique.has(key)).sort(compare);
+          const removedUnique = [...previousUnique].filter((key) => !desiredUnique.has(key));
+          if (removedUnique.length)
+            yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND attribute IN ${sql.in(removedUnique)}`;
+          const members = new Map(desired.shapes.map((s) => [s.key, new Set(s.attributes)]));
           for (const e of entities) {
-            const after = yield* stage(
-              steps,
-              account,
-              e,
-              { ...e, facts: retain(e.facts, findShape(desired, e.shape)!), registry_version: current.version + 1 },
-              desired,
-              edges,
-              actor,
-              "migration",
-            );
-            yield* unique(account, after, desired);
+            const keys = Object.keys(e.facts).filter((key) => !members.get(e.shape)!.has(key));
+            let after = e;
+            if (keys.length) {
+              const released = keys.filter((key) => previousUnique.has(key) && desiredUnique.has(key));
+              if (released.length)
+                yield* sql`DELETE FROM live_unique WHERE account_id=${account} AND entity_id=${e.id} AND attribute IN ${sql.in(released)}`;
+              const facts = { ...e.facts };
+              for (const key of keys) delete facts[key];
+              after = yield* stage(
+                steps,
+                account,
+                e,
+                { ...e, facts, registry_version: current.version + 1 },
+                desired,
+                edges,
+                actor,
+                "migration",
+              );
+            }
+            // The exclusive account lock excludes all writers of these values.
+            for (const key of addedUnique) if (key in after.facts) yield* insertUnique(account, after.id, key, after.facts[key]!, true);
           }
           function* retained() {
             for (const e of entities) yield { ...e, facts: retain(e.facts, findShape(desired, e.shape)!) };

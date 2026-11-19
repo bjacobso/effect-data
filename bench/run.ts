@@ -23,9 +23,12 @@ const workers = 16;
 if (!Number.isSafeInteger(bigCount) || bigCount < workers + 6 || !Number.isSafeInteger(writesPerWorker) || writesPerWorker < 1)
   throw new Error("BENCH_ENTITIES must be at least 22 and BENCH_WRITES must be positive");
 
-const namespace = `effect_data_bench_${mode}`;
-const big = "bench_big";
-const small = Array.from({ length: 100 }, (_, i) => `bench_small_${i}`);
+// Advisory locks are database-wide, so isolation needs both a separate
+// fixture schema and a different account key while the investigation runs.
+const fixes = mode === "pass5" && step !== "investigation";
+const namespace = fixes ? "effect_data_bench_pass5_fixes" : `effect_data_bench_${mode}`;
+const big = fixes ? "bench_big_fixes" : "bench_big";
+const small = Array.from({ length: 100 }, (_, i) => `${fixes ? "bench_small_fixes" : "bench_small"}_${i}`);
 const smallCount = 32;
 const historySizes = [10, 1_000, 10_000];
 const historySamples = 30;

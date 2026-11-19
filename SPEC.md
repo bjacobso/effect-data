@@ -274,9 +274,13 @@ as a PostgreSQL deadlock victim is retried with bounded backoff.
 - Entity writes take a shared account advisory lock plus row locks; registry
   apply takes the exclusive account lock. Uniqueness is enforced by a unique
   index, not check-then-insert.
-- Known limits, measured in REPORT.md Pass 4: registry apply over 1M entities
-  holds the exclusive account lock for about 80 s, blocking all writes to that
-  account; `as_of` replays an entity's full history.
+- Registry apply takes no per-value advisory locks. Its exclusive account
+  lock guards changes to the live uniqueness projection.
+- Known limits, measured in REPORT.md Pass 5 step B1 at 1M live entities:
+  attaching an optional member held the exclusive account lock for 21.49 s,
+  enabling uniqueness for 273.19 s and retracting a populated member for
+  150.21 s. The lock blocks all writes to that account. `as_of` replays an
+  entity's full history.
 
 ## 10. Composition
 
