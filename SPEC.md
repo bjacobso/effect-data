@@ -10,7 +10,7 @@ the behaviour it describes.
   and this file must be brought back into agreement; PLAN.md is not edited
   after its pass lands.
 
-Status: through **Pass 6** (soft removal and background rollout). Packs: `onboarding`,
+Status: through **Pass 6**, with the Pass 7 typed cell projection. Packs: `onboarding`,
 `certification`.
 
 ## 1. Model
@@ -333,6 +333,17 @@ restored dangling ref blocks a strict apply or becomes a rollout violation.
   Entity writes maintain `entities`, `live_unique` and `live_refs` in
   the same transaction as the facts. Registry rollouts reconcile the
   uniqueness projection and violation records in background transactions.
+- `cells` projects the stored facts of live entities, including hidden
+  values, in the same transaction as entity writes. A missing fact has no
+  row. Each cell stores one value in a text (`C` collation), numeric,
+  boolean or date column according to the current attribute type. A flagged
+  text cell holds JSON for strings with a NUL or a lone surrogate and for
+  hidden legacy values that cannot be represented in the current column.
+  The value contract and historical facts are unchanged.
+- Migration backfills live cells from stored entity documents. Registry
+  type changes rebuild affected cells under the exclusive account lock.
+  Membership changes leave cells untouched. Typed indexes include account,
+  attribute, typed value (a bounded prefix for text), and entity id.
 - Registry versions are recorded on apply. The registry-history migration
   captures the current document for existing accounts at backfill time.
 - `live_refs` projects stored ref facts, including hidden values, using the

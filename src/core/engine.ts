@@ -15,6 +15,7 @@ import {
   findShape,
   findAttribute,
 } from "./model.ts";
+import { cellTypes } from "./cellTypes.ts";
 import { attributeEdges } from "./kinds.ts";
 import { evaluator } from "./rules.ts";
 import { storedRefTarget, valueSchema } from "./values.ts";
@@ -98,7 +99,18 @@ export function engine(kinds: readonly RegisteredKind[]) {
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
     const reactions = new Map<string, Automation[]>();
     for (const d of r.automations ?? []) for (const key of d.on.changed) reactions.set(key, [...(reactions.get(key) ?? []), d]);
-    return { schemas, attributes, members, visible, unique, rules, reactions, storedRefTarget, edges: attributeEdges(r.attributes ?? []) };
+    return {
+      schemas,
+      attributes,
+      members,
+      visible,
+      unique,
+      rules,
+      reactions,
+      storedRefTarget,
+      cells: cellTypes(r.attributes),
+      edges: attributeEdges(r.attributes ?? []),
+    };
   }
   function validate(r: Registry, shape: string, facts: Facts): Issue[] {
     const s = findShape(r, shape);

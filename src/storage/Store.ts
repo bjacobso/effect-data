@@ -3,6 +3,7 @@ import { Context, Effect, Layer, Schedule } from "effect";
 import { SqlClient } from "effect/sql";
 import { SqlError } from "effect/sql/SqlError";
 import { Engine, type ApplyMode, type Compiled } from "../core/engine.ts";
+import { cells } from "./cells.ts";
 import { liveRefs } from "./liveRefs.ts";
 import { Clock } from "./Clock.ts";
 import {
@@ -51,6 +52,7 @@ export const makeStore = (hashOverride?: string) =>
       app = yield* Engine,
       clock = yield* Clock;
     const refs = liveRefs(sql);
+    const typed = cells(sql);
     const unique = liveUnique(sql, hashOverride);
     const records = violations(sql);
     const jobs = rollouts(sql, unique, records, clock.reserve);
@@ -207,11 +209,18 @@ export const makeStore = (hashOverride?: string) =>
         steps.push({ entity: next, keys, before: before?.facts ?? {}, actor, reason, kind, resolved });
         return next;
       });
-    const flush = (account: string, steps: Step[], deliveries: Delivery[] = []) =>
+    const flush = (account: string, steps: Step[], config: Compiled, deliveries: Delivery[] = []) =>
       Effect.gen(function* () {
         const projections = new Map<string, Entity>();
         if (!steps.length) return projections;
         const probe = yield* StoreProbe;
+        const cellWrites = new Map<string, { entity: Entity; keys: Set<string>; deleted: boolean }>();
+        for (const { entity, keys, kind } of steps) {
+          const changed = cellWrites.get(entity.id)?.keys ?? new Set<string>();
+          for (const key of keys) changed.add(key);
+          cellWrites.set(entity.id, { entity, keys: changed, deleted: kind === "delete" });
+        }
+        yield* typed.write(account, cellWrites.values(), config.cells);
         // All validation and unique-value work precedes this short clock critical section.
         probe?.phase("clock reserve");
         const allocation = yield* clock.reserve(account, steps.length);
@@ -353,7 +362,7 @@ export const makeStore = (hashOverride?: string) =>
                   entity = yield* stage(steps, account, entity, updated, c, `automation:${a.id}`, "automation");
                 } else deliveries.push({ index: steps.length - 1, entity_id: entity.id, automation_id: a.id, action: instruction.payload });
               }
-          const committed = yield* flush(account, steps, deliveries);
+          const committed = yield* flush(account, steps, c, deliveries);
           probe?.phase("transaction completion");
           return { ...(committed.get(entity.id) ?? entity), facts: c.visible(shape, entity.facts), effects };
         }),
@@ -522,6 +531,7 @@ export const makeStore = (hashOverride?: string) =>
                 work,
                 config,
                 edgeSources,
+                previousCells: previousConfig.cells,
                 uniqueSlots,
               };
             }),
@@ -577,6 +587,10 @@ export const makeStore = (hashOverride?: string) =>
             }
             if (snapshot.previous.size || snapshot.edges.size)
               yield* refs.reconcile(account, snapshot.previous, snapshot.config, snapshot.edgeSources.values());
+            for (const [attribute, type] of snapshot.config.cells) {
+              const previous = snapshot.previousCells.get(attribute);
+              if (previous && previous.type !== type.type) yield* typed.rebuild(account, snapshot.config.cells, attribute);
+            }
             probe?.phase("registry write");
             const job =
               mode === "rollout"
@@ -687,7 +701,7 @@ export const makeStore = (hashOverride?: string) =>
             const after = { ...referrer, facts: merge(referrer.facts, { [row.attribute]: null }), registry_version: version };
             referrer = yield* stage(steps, account, referrer, after, config, `reference:${id}`, "reference");
           }
-          yield* flush(account, steps);
+          yield* flush(account, steps, config);
         }),
       );
     const referrers = (account: string, id: string) =>
