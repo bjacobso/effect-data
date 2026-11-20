@@ -162,7 +162,7 @@ describe("registry pipeline", () => {
     const r = { ...extended.empty(), views: [{ id: "x", target: "missing" }] };
     expect(extended.structure(r)).toEqual([]);
     expect(extended.check(r).map((x) => x.field)).toEqual(["views[0].target"]);
-    expect(compose([]).empty()).toEqual({ attributes: [], shapes: [], automations: [] });
+    expect(compose([]).empty()).toEqual({ attributes: [], shapes: [], automations: [], queries: [] });
   });
   test("unknown properties, duplicates, operation/operator paths and depth", () => {
     const r = fixture();
@@ -451,5 +451,5 @@ test("kind ordering is metadata, and callback arguments follow their schemas", (
     },
   });
   const e = engine(collect([...app.kinds].reverse().concat(collect([a], { typed: op }).kinds), {}).kinds);
-  expect(e.kinds.map((k) => k.name)).toEqual(["view", "attribute", "shape", "policy", "automation"]);
+  expect(e.kinds.map((k) => k.name)).toEqual(["view", "attribute", "shape", "policy", "automation", "query"]);
 });

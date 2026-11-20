@@ -2,6 +2,7 @@ import { Effect, Layer, Schema } from "effect";
 import { HttpApi, HttpApiGroup, HttpApiEndpoint, HttpApiBuilder, HttpApiSchema } from "effect/http-api";
 import { Engine, type ApplyMode, type EngineValue } from "../core/engine.ts";
 import { type Registry, issue } from "../core/model.ts";
+import { storedQuery, inlineQuery } from "./queries.ts";
 import { realDate } from "../core/values.ts";
 import { Store } from "../storage/Store.ts";
 import { ensure, Invalid, NotFound } from "../Errors.ts";
@@ -24,6 +25,8 @@ export function coreApi(engine: EngineValue) {
     .add(
       HttpApiGroup.make("core")
         .add(
+          storedQuery,
+          inlineQuery,
           HttpApiEndpoint.get("registry", "/v2/registry", {
             success: Schema.Struct({ ...registry.fields, rollout: RolloutSchema }),
             error: errors,
@@ -134,6 +137,9 @@ export const CoreHttpLive = Layer.unwrap(
             }),
           );
         return h.handleAll({
+          storedQuery: ({ params, payload }) => respond(Effect.flatMap(Tenant, (t) => store.runQuery(t.account, params.id, payload))),
+          inlineQuery: ({ payload: { query, ...options } }) =>
+            respond(Effect.flatMap(Tenant, (t) => store.runQuery(t.account, query, options))),
           registry: () =>
             respond(
               Effect.gen(function* () {

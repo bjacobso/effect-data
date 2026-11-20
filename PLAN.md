@@ -1028,3 +1028,151 @@ The storage decision and its cost; kind-protocol fit, file by file; the
 differential test's case count and anything it found; query latency on the
 benchmark data with and without the cell indexes (add to `make bench`);
 results of all conformance suites including a new `conformance/data-queries.ts`.
+
+## Pass 7: queries
+
+Goal: list entities by their facts. A query is a registry kind checked by the
+existing reference and typed-rule machinery, compiled to SQL with the
+inherited three-valued semantics intact. This section replaces "Deferred:
+queries" above; where they differ, this section wins. Branch:
+`pass-7-queries`. New routes and a new kind are wire-contract additions, so
+SPEC.md changes in the same commits (sections 2, 3, 8, 9 and 11 at least).
+
+### 0. Storage decision (own commit, first; report it separately)
+
+`facts.value` is jsonb holding a JSON string of canonical JSON, and
+`entities.document` is text, so neither can be queried by type. Add a typed
+projection maintained in the write transaction, like `live_unique`:
+
+    cells(account_id, entity_id, shape, attribute,
+          s text COLLATE "C", n numeric, b boolean, d date)
+
+- One row per **stored** fact of a live entity, hidden or visible, with exactly
+  one typed column set, chosen by the attribute's **current** type (`string`,
+  `enum` and `ref` use `s`; `integer` and `number` use `n`). An absent fact is
+  an absent row. Deleting an entity removes its rows.
+- **Why hidden facts stay:** a query names a shape and may only use attributes
+  of that shape (section 1), so hidden facts are never queried. Soft removal
+  and restore (Pass 6) then need no cell writes at all.
+- **Type changes** rebuild that attribute's cells before commit, under the
+  exclusive lock, exactly as Pass 6 does for type changes to or from `ref`.
+  Pass 6 already guarantees that restored values decode under the new type.
+- Index `(account_id, attribute, <typed column>, entity_id)` per typed column.
+  Measure whether `shape` belongs in the index too and justify the choice.
+- **NUL in strings:** `text` cannot hold NUL. Either reject NUL in string
+  values from now on (a contract change: say what happens to existing stored
+  values), or store those cells flagged and evaluate them in memory. Choose,
+  justify, and put the rule in SPEC.md.
+- Backfill cells for existing data in the migration. Facts, history and
+  `as_of` are unchanged.
+- Measure the write cost: PATCH writes/s for one account and across 100
+  accounts, before and after cells. Target: no more than 15% slower.
+
+### 1. The query kind (core)
+
+```json
+{ "id": "co-drivers", "shape": "employee",
+  "where": { "all": [ { "fact": "employee/work_state", "operator": "equal", "value": "CO" },
+                      { "fact": "employee/role", "operator": "equal", "value": "driver" } ] },
+  "order_by": [ { "attribute": "employee/salary", "direction": "desc" } ] }
+```
+
+- Collection `queries`, kind order 45, identity `id` (the usual id pattern).
+  Field order: `id, shape, where, order_by`. `where` is optional (absent = T).
+- `where` is a rule checked exactly like policy rules: facts must be
+  attributes of the shape, and operators and values are typed.
+- `order_by` has 0–3 items, each `{ attribute, direction: "asc" | "desc" }`,
+  attributes in the shape, unique, not `ref`, not `boolean`.
+- Retired attributes and attributes not in the shape are reported by the
+  normal reference checks, so registry checking keeps every stored query
+  valid against the current registry.
+- The kind is generic: it lives in core, beside attributes, shapes and
+  automations, not in a pack.
+
+### 2. Running
+
+- `POST /v2/queries/{id}/run` runs a stored query. `POST /v2/query` runs an
+  inline query document checked with the same kind checks against the current
+  registry (issues → 422 at `query.<path>`). Both take `{ limit?: 1..200
+  (default 50), after?: <cursor>, match?: "true" | "unknown" (default
+  "true") }` and return `{ data: [entity], next_after }`.
+- `match: "true"` returns entities where `where` is T; `"unknown"` returns
+  those where it is U. F is never returned.
+- Each entity is the same document `GET /v2/entities/{id}` returns, including
+  open `violations` and with hidden facts left out.
+- Order: `order_by`, then entity id ascending. Absent values sort last in
+  either direction. Comparison is by the typed column (code point order for
+  strings, `COLLATE "C"`). The cursor is an opaque keyset string; a cursor
+  from a different query, registry version or `match` is a 400.
+- Live data only; `as_of` queries are out of scope. A page reads one snapshot,
+  but pages are not consistent with each other: say so in SPEC.md.
+- Unknown query id → 404.
+
+### 3. Compiling rules to SQL
+
+One compiler, `rule → SQL boolean expression`, in `src/storage/`, where SQL
+`NULL` is U. It consumes the rule plus compiled attribute metadata (which typed
+column, and `ignore_case` support) from core; storage stays free of
+attribute-type knowledge beyond what `compile()` hands it.
+
+- SQL `AND`, `OR` and `NOT` over `NULL` match the inherited `all`, `any` and
+  `not` tables. Empty `all` → `TRUE`, empty `any` → `FALSE`.
+- A condition on an absent cell → `NULL`, except `exists` and
+  `doesNotExist`. Check `in` and `notIn` on absent facts carefully.
+- `ignore_case`: the in-memory evaluator uses JS `toLowerCase()`, and Postgres
+  `lower()` differs outside ASCII. Define one rule, make both sides agree, and
+  put it in SPEC section 3. If you change the in-memory behaviour, that is a
+  contract change: record it in SPEC.md and REPORT.md.
+- Every condition must be able to use the cell indexes for selective
+  queries; check the plans with `EXPLAIN` on the benchmark data.
+
+**Differential property test (the core of this pass):** for generated
+registries, entities and rules, the SQL verdict (T, F or U per entity,
+obtained through `match`) equals the in-memory evaluator on every entity.
+Include absent facts, `in`/`notIn` with absent facts, `ignore_case` on
+non-ASCII strings, numeric and safe-integer boundaries, dates, depth-20 rules,
+hidden facts (removed from the shape after being written), and a type change
+followed by a query. At least 200 cases.
+
+Also test ordering and paging: walking every page with random `limit`s
+returns each matching entity exactly once, in the order the in-memory sort
+gives.
+
+### 4. Conformance
+
+New black-box suite `conformance/data-queries.ts` (Effect, no `src/`
+imports): store and run a query; inline queries; `match: "unknown"`; ordering
+with absent values in both directions; paging to the end; cursor misuse →
+400; registry checks on the query kind (unknown fact, wrong operator type,
+`order_by` on a ref, retired attribute); a hidden attribute disappearing from
+results and its values returning on restore; results carrying open
+violations. Keep every existing suite green.
+
+### 5. Benchmark
+
+On the 1M-entity account, record p50/p95 for: a selective equality query
+(about 0.1% match), a range query with `order_by` and `limit 50`, an `any` of
+two conditions, a `not`, `match: "unknown"`, and a deep page (the 200th page
+by cursor). Report each with and without the cell indexes, plus the `EXPLAIN`
+plan of the selective query. Target: selective query p95 under 50 ms. Also
+record the PATCH throughput before and after cells (target in section 0), and
+how long the cells backfill took.
+
+### Constraints for this pass
+
+- Core changes go in new files where possible. Report net lines changed in
+  existing core files and why (aim: 60 or fewer).
+- Do not change PostgreSQL configuration.
+- Commits: section 0, then the kind and running together with the compiler,
+  then benchmark and report. Each behaviour commit updates SPEC.md.
+- Stop for QUESTIONS.md only on a genuine contradiction that no reasonable
+  reading resolves. For smaller gaps, choose the option most consistent with
+  the plan, implement it and record the choice in REPORT.md.
+
+### REPORT.md "Pass 7" section
+
+The storage decision and its cost (backfill time, write throughput, table and
+index size at 1M); the NUL and `ignore_case` decisions; how the query kind fit
+the kind protocol, file by file; the differential test's case count and
+anything it found; query latencies against the targets; conformance results;
+lines changed by layer.

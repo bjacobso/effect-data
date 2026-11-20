@@ -1110,3 +1110,173 @@ concurrent writes waited for the lock. The final database contained one
 million strict uniqueness slots, all 1,000 duplicate records resolved by
 the untimed reset, one million retained hidden values, zero migration
 facts and zero running jobs. [Raw benchmark results](bench/results-pass6-current.json)
+
+## Pass 7
+
+### Typed cell projection
+
+The migration pages over live entity documents and backfills one cell per
+stored fact. It creates the secondary indexes after loading the cells.
+Deployments run the migration with pre-Pass 7 writers stopped. Entity writes
+maintain the final cells in the same transaction as the entity, events and
+facts. Cell maintenance shares the entity projection statement to avoid
+an extra database round trip. Multiple automation steps can update the same fact in one transaction, so only the
+last value needs to reach the cell. The immutable log still records every
+step. Reference clears retract their cells, and deletion removes every cell
+for the entity, including hidden cells.
+
+Type changes rebuild the affected attribute under the exclusive account
+lock. A membership-only change leaves the stored cells in place. Hidden
+legacy values that cannot be stored in the new typed column retain a
+flagged JSON representation until they are changed or restored. Registry
+validation checks those values before they become visible again.
+
+NUL and lone surrogates remain valid input and round-trip as flagged JSON
+cells. If a query compares or sorts a relevant flagged cell, or supplies an
+operand PostgreSQL cannot encode, the Store evaluates the rules and sort keys
+with JavaScript in the same repeatable-read snapshot. Exceptionally wide rule
+trees also use this path to bound the size of generated SQL. For case
+insensitivity the cell holds the JavaScript lowercase form when it differs
+from the original. This preserves the inherited `toLowerCase()` behavior,
+including non-ASCII case mappings, without relying on PostgreSQL's locale.
+
+Text equality and membership use an index on the first 384 code points and
+verify the complete value. The value indexes cover attribute names up to
+768 bytes to keep index entries within PostgreSQL's B-tree size limit.
+Longer names use the attribute index. The attribute index also scopes
+presence and predicates like substring searches that cannot use an arbitrary
+B-tree value range. Numeric and date conditions that also supply the sole
+sort key can use the typed index for both range and ordering.
+
+### Query kind and execution
+
+| File | Role |
+| --- | --- |
+| `src/core/queryKind.ts` | Declares the core kind, field order, references, duplicate sort-key check and typed rule checks. |
+| `src/core/cellTypes.ts` | Maps each attribute to its cell column and records case-folding support. |
+| `src/core/engine.ts` | Reuses the same per-document validation for registry and inline queries and supplies compiled cell metadata. |
+| `src/composition.ts` | Registers queries at kind order 45 in every pack configuration. |
+| `src/http/queries.ts` and `src/http/handler.ts` | Define both routes, their request and response schemas, and tenant-aware dispatch. |
+| `src/storage/Store.ts` | Resolves and checks the query in a repeatable-read transaction and reuses the entity GET projection, including open violations. |
+| `src/storage/querySql.ts` and `src/storage/queryPage.ts` | Compile three-valued predicates, choose indexed candidate sets, and apply keyset pagination. |
+
+The inline query document goes under `query`. A cursor binds to the account,
+registry version, query definition, route and match mode. Limit can change
+between requests. The final page returns a null cursor. Stored-query
+resolution comes before cursor validation, so a removed query id returns
+404. Ordering uses the original string spelling, with nulls last and entity
+id ascending. PostgreSQL uses three-valued boolean operators for nested
+rules and returns SQL NULL for a missing comparison operand. The compiler
+can narrow a query to candidates from an equality or range, a union for
+eligible disjunctions, or the opposite truth set for a negation.
+
+The differential test ran 220 generated registry, dataset, and rule cases.
+It compared T and U rows directly, checked F by exclusion, and walked the
+T pages with randomized limits and sort directions. It covered absent
+operands, non-ASCII case folding, long indexed prefixes, numeric boundaries,
+dates including year 0000, depth-20 rules and hidden facts. Separate storage
+cases covered type rebuilds, refs, exceptional text and deletion. The test
+exposed a cursor repeat for extreme finite numbers. Binding a JavaScript
+number as float8 before casting it to numeric rounded it differently from
+the stored decimal. Numeric operands and cursor keys now bind their
+decimal spelling directly.
+
+### Verification and source size
+
+`make test` passed 55/55. Against `make run` at
+`BASE_URL=http://localhost:8086`, `data.ts` passed 15/15, `data-certs.ts`
+6/6, `data-refs.ts` 7/7, `data-rollout.ts` 3/3, and the new
+`data-queries.ts` 4/4. With `PACKS=onboarding`, `data.ts` passed 15/15
+again. Both application server runs were stopped. PostgreSQL configuration
+was unchanged.
+
+| TypeScript layer | Pass 6 | Pass 7 | Net |
+| --- | ---: | ---: | ---: |
+| Core | 939 | 1,011 | +72 |
+| Storage | 1,247 | 1,769 | +522 |
+| HTTP | 417 | 449 | +32 |
+| Packs | 290 | 290 | 0 |
+| Composition and migration wiring | 116 | 120 | +4 |
+| **Total `src/`** | **3,009** | **3,639** | **+630** |
+| Migrations | 106 | 130 | +24 |
+| Tests | 1,714 | 1,974 | +260 |
+| Conformance | 1,871 | 2,058 | +187 |
+| Benchmark code | 487 | 763 | +276 |
+
+Existing core code changed only in `engine.ts` (+42/−30, net +12). It
+extracts the existing kind checks for reuse and adds cell metadata to the
+compiled registry. The query kind and cell type mapping account for the
+other 60 core lines.
+
+### One-million-entity benchmark
+
+The dedicated schema contains one million live entities in one shape and 100
+additional accounts with 16 entities each. The large account has two
+populated numeric facts per entity and text on 1% of entities. PATCH
+throughput uses a changing numeric fact on 16 hot entities per account.
+It measures the Pass 6 Store at `ecb0f6c` before the migration and the Pass 7
+Store afterward. Each scenario uses 16 clients, one warmup and five timed
+runs of 4,000 writes. The table reports median writes per second.
+
+The query timing uses the Store directly. Each case has three warmup
+requests and 30 measured requests with limit 50. The deep-page case first
+walks 199 pages and then times repeated reads with the cursor for page 200.
+The unindexed run retains the primary key for cell uniqueness and point
+lookups and removes every secondary cell index. The fixture schema is
+removed after the run.
+
+#### Cell storage and write cost
+
+The migration took **42.85 s**, including index creation. The large
+account had **2,010,016 cells** afterward. Across the fixture, the table
+and TOAST occupied **187.20 MiB** and indexes occupied **407.45 MiB**,
+including the 130.63 MiB primary key, 130.72 MiB attribute index, and
+144.58 MiB numeric index. The two text indexes took 0.75 MiB each. The
+boolean, date and exceptional indexes were empty in this fixture.
+
+| PATCH workload | Before cells (writes/s) | With cells (writes/s) | Change |
+| --- | ---: | ---: | ---: |
+| One account | 1,207 | 1,240 | +2.8% |
+| Across 100 accounts | 860 | 2,984 | +247.1% |
+
+Both medians in the final run were within the allowed 15% slowdown. The
+100-account baseline samples varied from 691 to 2,592 writes/s. An earlier
+million-row trial used a separate cell-write statement and three timed runs.
+That trial measured 2,119 → 948 writes/s on one account and 3,925 → 3,532
+across 100 accounts. The revised implementation shares the entity projection
+statement, and the timing run uses a full warmup per scenario. The variation
+between baseline trials leaves the isolated cell-write cost uncertain.
+
+#### Query latency
+
+| Query | Secondary indexes p50 / p95 (ms) | Primary key only p50 / p95 (ms) |
+| --- | ---: | ---: |
+| Equality, 0.1% match | 1.60 / 3.84 | 308.82 / 453.83 |
+| Ordered range, half the account | 2.00 / 4.20 | 551.26 / 927.78 |
+| `any`, two selective equalities | 1.96 / 6.03 | 298.95 / 594.09 |
+| `not`, last 1,000 sequence values | 208.69 / 379.35 | 630.31 / 1,154.94 |
+| `match: "unknown"`, missing text | 1.06 / 1.62 | 173.97 / 423.33 |
+| Page 200, entity-id order | 1.28 / 1.84 | 1.47 / 3.49 |
+
+The selective equality met the 50 ms p95 target. `EXPLAIN (ANALYZE,
+BUFFERS)` shows an index scan on `cells_n` constrained by account,
+attribute and numeric value, followed by 51 point lookups on
+`entities_pkey`. PostgreSQL reported 4.18 ms of execution. With only the
+primary key, the plan used a parallel cell scan and top-N sort and
+reported 298.24 ms. The ordered range used the numeric index for both
+the range and sort. In the negated range PostgreSQL chose the
+attribute index to satisfy entity-id ordering and filtered out 999,000
+rows before the first match. Page 200 uses the creation-event index and
+does not depend on the cell indexes.
+
+Adding `shape` before the value in the numeric index increased its size
+from 144.58 to 147.88 MiB. The alternate equality trial measured
+1.24 / 1.50 ms p50 / p95 and read the same 51 candidate rows in the
+same nested-loop plan. The shipped index omits shape because it provided
+no additional selectivity in this fixture and the smaller index already
+met the latency target. This comparison covers a single-shape account.
+
+Reproduce with `BENCH_BASELINE_DIR=/path/to/pass-6 make bench BENCH_MODE=pass7`
+using a checkout of `ecb0f6c` with the pinned dependencies installed.
+The JSON includes each throughput run, index sizes, and the full equality,
+range and negation plans. [Raw benchmark results](bench/results-pass7-current.json)

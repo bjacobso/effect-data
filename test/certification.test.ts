@@ -45,7 +45,7 @@ test("certification registry checks and compiles using existing kind/op primitiv
   const r = fixture();
   expect(app.structure(r)).toEqual([]);
   expect(app.check(r)).toEqual([]);
-  expect(app.kinds.map((k) => k.name)).toEqual(["attribute", "shape", "policy", "certification_requirement", "automation"]);
+  expect(app.kinds.map((k) => k.name)).toEqual(["attribute", "shape", "policy", "certification_requirement", "automation", "query"]);
   expect(app.compile(r).schemas.has("employee")).toBe(true);
   const removed = { ...r, certification_requirements: [] };
   expect(app.plan(r, removed, []).issues.map((x) => x.field)).toEqual(["automations[0].do[0].requirement"]);
@@ -118,7 +118,7 @@ test("enabled collections are optional inputs and normalized outputs; disabled c
 
 test("selection preserves pack order, supports zero/one/multiple packs and rejects unknown names", () => {
   expect(selectPacks("certification,onboarding").map((p) => p.name)).toEqual(["certification", "onboarding"]);
-  expect(compose(selectPacks("")).empty()).toEqual({ attributes: [], shapes: [], automations: [] });
+  expect(compose(selectPacks("")).empty()).toEqual({ attributes: [], shapes: [], automations: [], queries: [] });
   expect(() => selectPacks("not-a-pack")).toThrow("Unknown pack");
   expect(() => selectPacks("onboarding,onboarding")).toThrow("Duplicate pack");
 });

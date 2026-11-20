@@ -6,6 +6,7 @@ import shapes from "../migrations/0004_event_shapes.ts";
 import versions from "../migrations/0005_registry_versions.ts";
 import rollouts from "../migrations/0006_rollouts.ts";
 import targets from "../migrations/0007_stored_ref_targets.ts";
+import cells from "../migrations/0008_cells.ts";
 export const migrate = Migrator.make({})({
   loader: Migrator.fromRecord({
     "0001_facts": facts,
@@ -15,5 +16,6 @@ export const migrate = Migrator.make({})({
     "0005_registry_versions": versions,
     "0006_rollouts": rollouts,
     "0007_stored_ref_targets": targets,
+    "0008_cells": cells,
   }),
 });

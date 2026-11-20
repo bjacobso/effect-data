@@ -1,0 +1,159 @@
+{
+  "measured_at": "2026-11-20T01:14:04.557Z",
+  "node": "v24.13.0",
+  "postgres": "17.11 (Homebrew)",
+  "cpu": "Apple M2 Max",
+  "memory_bytes": 34359738368,
+  "fixture": {
+    "count": 1000000,
+    "cells": 2010016,
+    "workers": 16,
+    "writes": 250,
+    "small_accounts": 100,
+    "page_size": 50,
+    "deep_page": 200
+  },
+  "backfill_ms": 42848.48258300002,
+  "sizes": {
+    "cells heap and TOAST": 196296704,
+    "cells_pkey": 136978432,
+    "cells_attribute": 137068544,
+    "cells_s": 786432,
+    "cells_folded": 786432,
+    "cells_n": 151601152,
+    "cells_b": 8192,
+    "cells_d": 8192,
+    "cells_exceptional": 8192
+  },
+  "patch": {
+    "before": {
+      "one_account": {
+        "writes_per_second": 1206.5721990093184,
+        "runs": [
+          1042.293943047496,
+          1288.8530283434488,
+          1206.5721990093184,
+          1385.333280465782,
+          1197.4684468052171
+        ]
+      },
+      "across_100_accounts": {
+        "writes_per_second": 859.589794616867,
+        "runs": [
+          2591.648939858104,
+          859.589794616867,
+          778.924124197798,
+          690.8664469955112,
+          1571.6864872579984
+        ]
+      }
+    },
+    "after": {
+      "one_account": {
+        "writes_per_second": 1240.1793299311094,
+        "runs": [
+          1485.6641305846347,
+          1240.1793299311094,
+          984.8654395868164,
+          967.1807368171727,
+          1543.826881370166
+        ]
+      },
+      "across_100_accounts": {
+        "writes_per_second": 2984.0039662425465,
+        "runs": [
+          2735.3452595526364,
+          3594.8826385495686,
+          2203.2570749338674,
+          2984.0039662425465,
+          3124.363327980986
+        ]
+      }
+    }
+  },
+  "queries": {
+    "indexed": {
+      "equality": {
+        "p50_ms": 1.5959169999987353,
+        "p95_ms": 3.8368330000084825,
+        "samples": 30
+      },
+      "range": {
+        "p50_ms": 2.0013749999925494,
+        "p95_ms": 4.197583000001032,
+        "samples": 30
+      },
+      "any": {
+        "p50_ms": 1.960332999995444,
+        "p95_ms": 6.032500000001164,
+        "samples": 30
+      },
+      "not": {
+        "p50_ms": 208.6858329999959,
+        "p95_ms": 379.34875000000466,
+        "samples": 30
+      },
+      "unknown": {
+        "p50_ms": 1.0609590000240132,
+        "p95_ms": 1.6244580000056885,
+        "samples": 30
+      },
+      "deep": {
+        "p50_ms": 1.2764169999863952,
+        "p95_ms": 1.8424999999988358,
+        "samples": 30
+      }
+    },
+    "unindexed": {
+      "equality": {
+        "p50_ms": 308.8210409999883,
+        "p95_ms": 453.83116699999664,
+        "samples": 30
+      },
+      "range": {
+        "p50_ms": 551.2619999999879,
+        "p95_ms": 927.7816250000033,
+        "samples": 30
+      },
+      "any": {
+        "p50_ms": 298.9525409999769,
+        "p95_ms": 594.085791999998,
+        "samples": 30
+      },
+      "not": {
+        "p50_ms": 630.3057919999992,
+        "p95_ms": 1154.9396669999987,
+        "samples": 30
+      },
+      "unknown": {
+        "p50_ms": 173.9657920000027,
+        "p95_ms": 423.3292909999727,
+        "samples": 30
+      },
+      "deep": {
+        "p50_ms": 1.4696659999899566,
+        "p95_ms": 3.4884169999859296,
+        "samples": 30
+      }
+    },
+    "indexed_plans": {
+      "equality": "Limit  (cost=0.98..109.00 rows=10 width=250) (actual time=0.185..4.164 rows=51 loops=1)\n  Buffers: shared hit=103 read=156\n  ->  Nested Loop  (cost=0.98..109.00 rows=10 width=250) (actual time=0.185..4.161 rows=51 loops=1)\n        Buffers: shared hit=103 read=156\n        ->  Index Scan using cells_n on cells c  (cost=0.55..24.55 rows=10 width=25) (actual time=0.170..0.858 rows=51 loops=1)\n              Index Cond: ((account_id = 'bench_q'::text) AND (attribute = 'q/group'::text) AND (n = '7'::numeric))\n              Filter: ((NOT exceptional) AND (shape = 'item'::text))\n              Buffers: shared read=55\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..8.45 rows=1 width=250) (actual time=0.064..0.064 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=103 read=101\nPlanning:\n  Buffers: shared hit=3\nPlanning Time: 0.298 ms\nExecution Time: 4.177 ms",
+      "range": "Limit  (cost=0.98..159.90 rows=51 width=255) (actual time=0.072..0.645 rows=51 loops=1)\n  Buffers: shared hit=202 read=9\n  ->  Nested Loop  (cost=0.98..261950.81 rows=84065 width=255) (actual time=0.072..0.643 rows=51 loops=1)\n        Buffers: shared hit=202 read=9\n        ->  Index Scan using cells_n on cells c  (cost=0.55..47591.50 rows=82749 width=30) (actual time=0.035..0.047 rows=51 loops=1)\n              Index Cond: ((account_id = 'bench_q'::text) AND (attribute = 'q/sequence'::text) AND (n >= '500000'::numeric))\n              Filter: ((NOT exceptional) AND (shape = 'item'::text))\n              Buffers: shared hit=3 read=4\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..2.59 rows=1 width=250) (actual time=0.012..0.012 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=199 read=5\nPlanning:\n  Buffers: shared hit=3\nPlanning Time: 0.312 ms\nExecution Time: 0.656 ms",
+      "not": "Limit  (cost=0.98..2213.87 rows=51 width=250) (actual time=239.246..239.673 rows=51 loops=1)\n  Buffers: shared hit=256 read=31874\n  ->  Nested Loop  (cost=0.98..134770.26 rows=3106 width=250) (actual time=239.245..239.670 rows=51 loops=1)\n        Buffers: shared hit=256 read=31874\n        ->  Index Scan using cells_attribute on cells c  (cost=0.55..111565.90 rows=3057 width=25) (actual time=239.216..239.227 rows=51 loops=1)\n              Index Cond: ((account_id = 'bench_q'::text) AND (attribute = 'q/sequence'::text))\n              Filter: ((n IS NOT NULL) AND (NOT exceptional) AND (n > '999000'::numeric) AND (shape = 'item'::text) AND (octet_length(attribute) <= 768))\n              Rows Removed by Filter: 999000\n              Buffers: shared hit=53 read=31873\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..7.59 rows=1 width=250) (actual time=0.008..0.008 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=203 read=1\nPlanning:\n  Buffers: shared hit=3\nPlanning Time: 0.305 ms\nExecution Time: 239.686 ms"
+    },
+    "unindexed_plans": {
+      "equality": "Limit  (cost=45974.51..45975.44 rows=8 width=250) (actual time=296.599..298.207 rows=51 loops=1)\n  Buffers: shared hit=7747 read=20224\n  ->  Gather Merge  (cost=45974.51..45975.44 rows=8 width=250) (actual time=296.599..298.204 rows=51 loops=1)\n        Workers Planned: 2\n        Workers Launched: 2\n        Buffers: shared hit=7747 read=20224\n        ->  Sort  (cost=44974.49..44974.50 rows=4 width=250) (actual time=280.688..280.690 rows=40 loops=3)\n              Sort Key: c.entity_id COLLATE \"C\"\n              Sort Method: top-N heapsort  Memory: 50kB\n              Buffers: shared hit=7747 read=20224\n              Worker 0:  Sort Method: top-N heapsort  Memory: 50kB\n              Worker 1:  Sort Method: top-N heapsort  Memory: 50kB\n              ->  Nested Loop  (cost=0.42..44974.45 rows=4 width=250) (actual time=1.044..279.965 rows=333 loops=3)\n                    Buffers: shared hit=7737 read=20218\n                    ->  Parallel Seq Scan on cells c  (cost=0.00..44940.67 rows=4 width=25) (actual time=0.416..141.927 rows=333 loops=3)\n                          Filter: ((n IS NOT NULL) AND (NOT exceptional) AND (account_id = 'bench_q'::text) AND (attribute = 'q/group'::text) AND (shape = 'item'::text) AND (n = '7'::numeric) AND (octet_length(attribute) <= 768))\n                          Rows Removed by Filter: 671272\n                          Buffers: shared hit=5816 read=18137\n                    ->  Index Scan using entities_pkey on entities e  (cost=0.42..8.45 rows=1 width=250) (actual time=0.413..0.413 rows=1 loops=1000)\n                          Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n                          Filter: (NOT deleted)\n                          Buffers: shared hit=1921 read=2081\nPlanning Time: 2.982 ms\nExecution Time: 298.238 ms",
+      "range": "Limit  (cost=48523.19..48658.94 rows=51 width=255) (actual time=171.130..175.622 rows=51 loops=1)\n  Buffers: shared hit=6202 read=18045, temp read=1485 written=2581\n  ->  Nested Loop  (cost=48523.19..272250.05 rows=84052 width=255) (actual time=171.130..175.618 rows=51 loops=1)\n        Buffers: shared hit=6202 read=18045, temp read=1485 written=2581\n        ->  Gather Merge  (cost=48522.76..58104.34 rows=82269 width=30) (actual time=171.097..174.859 rows=51 loops=1)\n              Workers Planned: 2\n              Workers Launched: 2\n              Buffers: shared hit=6000 read=18043, temp read=1485 written=2581\n              ->  Sort  (cost=47522.74..47608.44 rows=34279 width=30) (actual time=168.377..168.445 rows=780 loops=3)\n                    Sort Key: c.n, c.entity_id COLLATE \"C\"\n                    Sort Method: external merge  Disk: 6960kB\n                    Buffers: shared hit=6000 read=18043, temp read=1485 written=2581\n                    Worker 0:  Sort Method: external merge  Disk: 6792kB\n                    Worker 1:  Sort Method: external merge  Disk: 6848kB\n                    ->  Parallel Seq Scan on cells c  (cost=0.00..44940.67 rows=34279 width=30) (actual time=36.781..117.456 rows=166667 loops=3)\n                          Filter: ((n IS NOT NULL) AND (NOT exceptional) AND (n >= '500000'::numeric) AND (account_id = 'bench_q'::text) AND (attribute = 'q/sequence'::text) AND (shape = 'item'::text) AND (octet_length(attribute) <= 768))\n                          Rows Removed by Filter: 504938\n                          Buffers: shared hit=5913 read=18040\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..2.60 rows=1 width=250) (actual time=0.015..0.015 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=202 read=2\nPlanning Time: 0.287 ms\nExecution Time: 176.638 ms",
+      "not": "Limit  (cost=0.98..2930.82 rows=51 width=250) (actual time=312.221..313.302 rows=51 loops=1)\n  Buffers: shared hit=397 read=40005\n  ->  Nested Loop  (cost=0.98..178376.76 rows=3105 width=250) (actual time=312.220..313.296 rows=51 loops=1)\n        Buffers: shared hit=397 read=40005\n        ->  Index Scan using cells_pkey on cells c  (cost=0.55..155296.41 rows=3039 width=25) (actual time=311.676..311.760 rows=51 loops=1)\n              Index Cond: ((account_id = 'bench_q'::text) AND (attribute = 'q/sequence'::text))\n              Filter: ((n IS NOT NULL) AND (NOT exceptional) AND (n > '999000'::numeric) AND (shape = 'item'::text) AND (octet_length(attribute) <= 768))\n              Rows Removed by Filter: 999000\n              Buffers: shared hit=198 read=40000\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..7.59 rows=1 width=250) (actual time=0.029..0.029 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=199 read=5\nPlanning Time: 0.288 ms\nExecution Time: 313.320 ms"
+    },
+    "with_shape": {
+      "indexed_bytes": 155066368,
+      "equality": {
+        "p50_ms": 1.2435419999819715,
+        "p95_ms": 1.497917000000598,
+        "samples": 30
+      },
+      "explain": "Limit  (cost=0.98..109.00 rows=10 width=250) (actual time=0.021..0.472 rows=51 loops=1)\n  Buffers: shared hit=260\n  ->  Nested Loop  (cost=0.98..109.00 rows=10 width=250) (actual time=0.020..0.470 rows=51 loops=1)\n        Buffers: shared hit=260\n        ->  Index Scan using cells_n on cells c  (cost=0.55..24.55 rows=10 width=25) (actual time=0.010..0.023 rows=51 loops=1)\n              Index Cond: ((account_id = 'bench_q'::text) AND (attribute = 'q/group'::text) AND (shape = 'item'::text) AND (n = '7'::numeric))\n              Filter: (NOT exceptional)\n              Buffers: shared hit=56\n        ->  Index Scan using entities_pkey on entities e  (cost=0.42..8.45 rows=1 width=250) (actual time=0.009..0.009 rows=1 loops=51)\n              Index Cond: ((account_id = 'bench_q'::text) AND (id = (c.entity_id)::text))\n              Filter: (NOT deleted)\n              Buffers: shared hit=204\nPlanning:\n  Buffers: shared hit=3\nPlanning Time: 0.313 ms\nExecution Time: 0.480 ms"
+    }
+  }
+}

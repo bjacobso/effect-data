@@ -1,5 +1,6 @@
 import { Config, Effect, Layer } from "effect";
 import { attributeKind, shapeKind, automationKind, setOp } from "./core/kinds.ts";
+import { queryKind } from "./core/queryKind.ts";
 import { collect, KindRegistry } from "./core/registry.ts";
 import { engine, Engine } from "./core/engine.ts";
 import { Packs, type Pack } from "./Packs.ts";
@@ -9,7 +10,7 @@ import { onboardingPack } from "./packs/onboarding/index.ts";
 import { certificationPack } from "./packs/certification/index.ts";
 export function compose(packs: readonly Pack[]) {
   const ops = collect([], Object.assign({ set: setOp }, ...packs.map((p) => p.ops))).ops;
-  const registry = collect([attributeKind, shapeKind, automationKind(ops), ...packs.flatMap((p) => p.kinds)], ops);
+  const registry = collect([attributeKind, shapeKind, automationKind(ops), queryKind, ...packs.flatMap((p) => p.kinds)], ops);
   const value = { ...engine(registry.kinds), ops };
   return { ...value, layer: Layer.mergeAll(Layer.succeed(Engine, value), Layer.succeed(KindRegistry, registry), Packs.layer(packs)) };
 }

@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Schema } from "effect";
 import {
+  type Doc,
   type Registry,
   type Entity,
   type Issue,
@@ -15,6 +16,7 @@ import {
   findShape,
   findAttribute,
 } from "./model.ts";
+import { cellTypes } from "./cellTypes.ts";
 import { attributeEdges } from "./kinds.ts";
 import { evaluator } from "./rules.ts";
 import { storedRefTarget, valueSchema } from "./values.ts";
@@ -57,34 +59,33 @@ export function engine(kinds: readonly RegisteredKind[]) {
       ),
     );
   };
-  function check(r: Registry): Issue[] {
-    r = normalize(r);
-    return kinds.flatMap((k) =>
-      (r[k.collection] ?? []).flatMap((d, i) => {
-        const missingShape = k.references(d).find((ref) => ref.to === "shape" && !findShape(r, ref.key));
-        if (missingShape) return prefix(`${k.collection}[${i}]`, [issue(missingShape.path, "Unknown shape")]);
-        const errors = k
-          .references(d)
-          .flatMap((ref) => {
-            const target = kinds.find((k) => k.name === ref.to);
-            const resolved = target && r[target.collection]?.find((d) => d[target.identity] === ref.key);
-            const members = ref.context?.members ?? (ref.context?.shape ? findShape(r, ref.context.shape)?.attributes : undefined);
-            return !resolved ||
-              (ref.to === "attribute" && resolved.retired === true) ||
-              (ref.context?.shape && !members) ||
-              (members && !members.includes(ref.key))
-              ? [issue(ref.path, `Unknown ${ref.to} in context`)]
-              : [];
-          })
-          .concat(k.check(d, r));
-        const rank = (p: string) => {
-          const root = p.split(/[.[]/)[0]!;
-          return k.fields.indexOf(root);
-        };
-        errors.sort((a, b) => rank(a.field) - rank(b.field) || natural(a.field, b.field));
-        return prefix(`${k.collection}[${i}]`, errors);
-      }),
-    );
+  function checkDocument(k: RegisteredKind, d: Doc, r: Registry): Issue[] {
+    const missingShape = k.references(d).find((ref) => ref.to === "shape" && !findShape(r, ref.key));
+    if (missingShape) return [issue(missingShape.path, "Unknown shape")];
+    const errors = k
+      .references(d)
+      .flatMap((ref) => {
+        const target = kinds.find((k) => k.name === ref.to);
+        const resolved = target && r[target.collection]?.find((d) => d[target.identity] === ref.key);
+        const members = ref.context?.members ?? (ref.context?.shape ? findShape(r, ref.context.shape)?.attributes : undefined);
+        return !resolved ||
+          (ref.to === "attribute" && resolved.retired === true) ||
+          (ref.context?.shape && !members) ||
+          (members && !members.includes(ref.key))
+          ? [issue(ref.path, `Unknown ${ref.to} in context`)]
+          : [];
+      })
+      .concat(k.check(d, r));
+    const rank = (p: string) => {
+      const root = p.split(/[.[]/)[0]!;
+      return k.fields.indexOf(root);
+    };
+    errors.sort((a, b) => rank(a.field) - rank(b.field) || natural(a.field, b.field));
+    return errors;
+  }
+  function check(input: Registry): Issue[] {
+    const r = normalize(input);
+    return kinds.flatMap((k) => r[k.collection]!.flatMap((d, i) => prefix(`${k.collection}[${i}]`, checkDocument(k, d, r))));
   }
   function compile(r: Registry) {
     const attributes = new Map((r.attributes ?? []).map((a) => [a.key, valueSchema(a)]));
@@ -98,7 +99,18 @@ export function engine(kinds: readonly RegisteredKind[]) {
       for (const d of r[kind.collection] ?? []) for (const rule of kind.rules?.(d) ?? []) rules.set(canonical(rule), evaluator(rule));
     const reactions = new Map<string, Automation[]>();
     for (const d of r.automations ?? []) for (const key of d.on.changed) reactions.set(key, [...(reactions.get(key) ?? []), d]);
-    return { schemas, attributes, members, visible, unique, rules, reactions, storedRefTarget, edges: attributeEdges(r.attributes ?? []) };
+    return {
+      schemas,
+      attributes,
+      members,
+      visible,
+      unique,
+      rules,
+      reactions,
+      storedRefTarget,
+      cells: cellTypes(r.attributes),
+      edges: attributeEdges(r.attributes ?? []),
+    };
   }
   function validate(r: Registry, shape: string, facts: Facts): Issue[] {
     const s = findShape(r, shape);
@@ -223,7 +235,7 @@ export function engine(kinds: readonly RegisteredKind[]) {
     phase?.("apply overhead");
     return result;
   }
-  return { kinds, fields, payload, empty, normalize, structure, check, compile, validate, plan, preparePlan };
+  return { kinds, fields, payload, empty, normalize, structure, check, checkDocument, compile, validate, plan, preparePlan };
 }
 function natural(a: string, b: string): number {
   const tokens = (s: string) => s.match(/[a-z_]+|[0-9]+/g) ?? [];

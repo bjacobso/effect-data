@@ -13,4 +13,4 @@ fmt:
 BENCH_MODE ?= pass6
 BENCH_NODE_FLAGS ?=
 bench:
-	BENCH_MODE=$(BENCH_MODE) node --max-old-space-size=8192 $(BENCH_NODE_FLAGS) bench/run.ts
+	BENCH_MODE=$(BENCH_MODE) node --max-old-space-size=8192 $(BENCH_NODE_FLAGS) $(if $(filter pass7,$(BENCH_MODE)),bench/pass7.ts,bench/run.ts)

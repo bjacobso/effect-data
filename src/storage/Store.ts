@@ -3,6 +3,9 @@ import { Context, Effect, Layer, Schedule } from "effect";
 import { SqlClient } from "effect/sql";
 import { SqlError } from "effect/sql/SqlError";
 import { Engine, type ApplyMode, type Compiled } from "../core/engine.ts";
+import type { Query } from "../core/queryKind.ts";
+import { queryPage, type QueryOptions } from "./queryPage.ts";
+import { cells } from "./cells.ts";
 import { liveRefs } from "./liveRefs.ts";
 import { Clock } from "./Clock.ts";
 import {
@@ -15,6 +18,7 @@ import {
   compare,
   findShape,
   issue,
+  prefix,
   decodeIssues,
 } from "../core/model.ts";
 import { merge } from "../core/engine.ts";
@@ -51,6 +55,7 @@ export const makeStore = (hashOverride?: string) =>
       app = yield* Engine,
       clock = yield* Clock;
     const refs = liveRefs(sql);
+    const typed = cells(sql);
     const unique = liveUnique(sql, hashOverride);
     const records = violations(sql);
     const jobs = rollouts(sql, unique, records, clock.reserve);
@@ -140,6 +145,46 @@ export const makeStore = (hashOverride?: string) =>
         if (!rows[0]) return yield* Effect.fail(new NotFound());
         return JSON.parse(rows[0].document) as Entity;
       });
+    const presentEntities = (account: string, entities: Entity[], config: Compiled) =>
+      Effect.gen(function* () {
+        if (!entities.length) return [];
+        const open = yield* records.openFor(
+          account,
+          entities.map(({ id }) => id),
+        );
+        const byEntity = new Map<string, { attribute: string; issue: ViolationRecord["issue"] }[]>();
+        for (const { entity_id, attribute, issue } of open) {
+          let found = byEntity.get(entity_id);
+          if (!found) byEntity.set(entity_id, (found = []));
+          found.push({ attribute, issue });
+        }
+        return entities.map((entity) => ({
+          ...entity,
+          facts: config.visible(entity.shape, entity.facts),
+          violations: byEntity.get(entity.id) ?? [],
+        }));
+      });
+
+    const runQuery = (account: string, input: string | Query, options: QueryOptions) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const { version, registry } = yield* getRegistry(account);
+            const query =
+              typeof input === "string" ? ((registry.queries ?? []).find(({ id }) => id === input) as Query | undefined) : input;
+            if (!query) return yield* Effect.fail(new NotFound());
+            if (typeof input !== "string") {
+              const kind = app.kinds.find(({ name }) => name === "query")!;
+              const issues = kind.structure?.(query) ?? [];
+              yield* ensure(prefix("query", issues.length ? issues : app.checkDocument(kind, query, registry)));
+            }
+            const config = compiled(account, version, registry);
+            const page = yield* queryPage(sql, account, version, typeof input === "string" ? "stored" : "inline", query, config, options);
+            return { ...page, data: yield* presentEntities(account, page.data, config) };
+          }),
+        )
+        .pipe(Effect.provideService(SqlClient.BeginTransaction, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
+
     const readEntity = (account: string, id: string) =>
       sql
         .withTransaction(
@@ -148,16 +193,8 @@ export const makeStore = (hashOverride?: string) =>
             const stored = yield* getStored(account, id);
             const { version, registry } = yield* getRegistry(account);
             const config = compiled(account, version, registry);
-            const open = yield* records.openFor(account, [id]);
-            return {
-              entity: {
-                ...stored,
-                facts: config.visible(stored.shape, stored.facts),
-                violations: open.map(({ attribute, issue }) => ({ attribute, issue })),
-              },
-              registry,
-              config,
-            };
+            const [entity] = yield* presentEntities(account, [stored], config);
+            return { entity: entity!, registry, config };
           }),
         )
         .pipe(Effect.provideService(SqlClient.BeginTransaction, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"));
@@ -207,11 +244,18 @@ export const makeStore = (hashOverride?: string) =>
         steps.push({ entity: next, keys, before: before?.facts ?? {}, actor, reason, kind, resolved });
         return next;
       });
-    const flush = (account: string, steps: Step[], deliveries: Delivery[] = []) =>
+    const flush = (account: string, steps: Step[], config: Compiled, deliveries: Delivery[] = []) =>
       Effect.gen(function* () {
         const projections = new Map<string, Entity>();
         if (!steps.length) return projections;
         const probe = yield* StoreProbe;
+        const cellWrites = new Map<string, { entity: Entity; keys: Set<string>; deleted: boolean }>();
+        for (const { entity, keys, kind } of steps) {
+          const changed = cellWrites.get(entity.id)?.keys ?? new Set<string>();
+          for (const key of keys) changed.add(key);
+          cellWrites.set(entity.id, { entity, keys: changed, deleted: kind === "delete" });
+        }
+        let cellWrite = typed.writePrefix(account, cellWrites.values(), config.cells);
         // All validation and unique-value work precedes this short clock critical section.
         probe?.phase("clock reserve");
         const allocation = yield* clock.reserve(account, steps.length);
@@ -256,8 +300,12 @@ export const makeStore = (hashOverride?: string) =>
           document: JSON.stringify(e),
           deleted: deleted.has(e.id),
         }));
-        for (const batch of insertBatches(rows))
-          yield* sql`INSERT INTO entities ${batch} ON CONFLICT(account_id,id) DO UPDATE SET document=EXCLUDED.document,deleted=EXCLUDED.deleted`;
+        // The cell CTEs target disjoint keys and share the entity projection statement.
+        for (const batch of insertBatches(rows)) {
+          yield* sql`${cellWrite} INSERT INTO entities ${batch}
+            ON CONFLICT(account_id,id) DO UPDATE SET document=EXCLUDED.document,deleted=EXCLUDED.deleted`;
+          cellWrite = sql``;
+        }
         const changes: ViolationChange[] = steps.flatMap((step, i) =>
           step.resolved.map((record) => ({ ...record, tx: events[i]!.tx, at: events[i]!.at, status: "resolved" as const })),
         );
@@ -353,7 +401,7 @@ export const makeStore = (hashOverride?: string) =>
                   entity = yield* stage(steps, account, entity, updated, c, `automation:${a.id}`, "automation");
                 } else deliveries.push({ index: steps.length - 1, entity_id: entity.id, automation_id: a.id, action: instruction.payload });
               }
-          const committed = yield* flush(account, steps, deliveries);
+          const committed = yield* flush(account, steps, c, deliveries);
           probe?.phase("transaction completion");
           return { ...(committed.get(entity.id) ?? entity), facts: c.visible(shape, entity.facts), effects };
         }),
@@ -522,6 +570,7 @@ export const makeStore = (hashOverride?: string) =>
                 work,
                 config,
                 edgeSources,
+                previousCells: previousConfig.cells,
                 uniqueSlots,
               };
             }),
@@ -577,6 +626,10 @@ export const makeStore = (hashOverride?: string) =>
             }
             if (snapshot.previous.size || snapshot.edges.size)
               yield* refs.reconcile(account, snapshot.previous, snapshot.config, snapshot.edgeSources.values());
+            for (const [attribute, type] of snapshot.config.cells) {
+              const previous = snapshot.previousCells.get(attribute);
+              if (previous && previous.type !== type.type) yield* typed.rebuild(account, snapshot.config.cells, attribute);
+            }
             probe?.phase("registry write");
             const job =
               mode === "rollout"
@@ -687,7 +740,7 @@ export const makeStore = (hashOverride?: string) =>
             const after = { ...referrer, facts: merge(referrer.facts, { [row.attribute]: null }), registry_version: version };
             referrer = yield* stage(steps, account, referrer, after, config, `reference:${id}`, "reference");
           }
-          yield* flush(account, steps);
+          yield* flush(account, steps, config);
         }),
       );
     const referrers = (account: string, id: string) =>
@@ -760,6 +813,7 @@ export const makeStore = (hashOverride?: string) =>
       compiled,
       live,
       getLive,
+      runQuery,
       readEntity,
       mutate,
       apply,
