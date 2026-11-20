@@ -98,6 +98,8 @@ const ApiError = Schema.Struct({
   }),
 });
 
+const Page = Schema.Struct({ data: Schema.Array(Entity), next_after: Schema.NullOr(Schema.String) });
+
 type Method = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
 /** Send a request and decode a successful reply with `schema`. Any other status is a failure. */
@@ -353,6 +355,32 @@ const demo = Effect.gen(function* () {
   const v4 = yield* call(Registry, "PUT", "/v2/registry", { base_version: v3.version, ...v2doc });
   const back = yield* call(Entity, "GET", `/v2/entities/${ana.id}`);
   yield* say(`v${v4.version} puts it back: "${back.facts["person/nickname"]}". The apply wrote no facts either way.`);
+
+  // 11 --------------------------------------------------------------------
+  yield* step("Queries: the work list, in the same rule language as policies");
+  const fay = yield* create("employee", { "person/name": "Fay", "person/email": "fay@acme.co", "employee/work_state": "CO" }, "Fay");
+  yield* say(`Fay joins in Colorado; her role isn't known yet.`);
+  const coloradoDrivers = {
+    id: "colorado-drivers",
+    shape: "employee",
+    where: { all: [C("employee/work_state", "equal", "CO"), C("employee/role", "equal", "driver")] },
+    order_by: [{ attribute: "employee/forklift_expires", direction: "asc" }],
+  };
+  yield* http("PUT /v2/registry  (adds a stored query)");
+  const v5 = yield* call(Registry, "PUT", "/v2/registry", { base_version: v4.version, ...v2doc, queries: [coloradoDrivers] });
+  yield* http(`POST /v2/queries/colorado-drivers/run`);
+  const drivers = yield* call(Page, "POST", "/v2/queries/colorado-drivers/run", {});
+  yield* say(
+    `Colorado drivers, soonest licence expiry first (absent last): ${list(drivers.data.map((e) => `${who(e.id)} (${e.facts["employee/forklift_expires"] ?? "no licence on file"})`))}`,
+  );
+  yield* http(`POST /v2/queries/colorado-drivers/run  { match: "unknown" }`);
+  const unsure = yield* call(Page, "POST", "/v2/queries/colorado-drivers/run", { match: "unknown" });
+  yield* say(`Can't tell yet: ${list(unsure.data.map((e) => who(e.id)))}. Someone should ask about her role.`);
+  yield* http(`POST /v2/query  (inline, not stored)`);
+  const inline = yield* call(Page, "POST", "/v2/query", {
+    query: { id: "no-location", shape: "employee", where: C("employee/location", "doesNotExist"), order_by: [] },
+  });
+  yield* say(`Inline query, employees with no location: ${list(inline.data.map((e) => who(e.id)))}. (Registry is at v${v5.version}.)`);
 
   console.log(`\nDone. Everything above is in account ${account}; explore it with X-Account-Id: ${account}`);
 });

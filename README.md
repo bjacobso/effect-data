@@ -30,7 +30,7 @@ BASE_URL=http://localhost:8086 node conformance/data.ts
 For a guided tour, run `make demo` against `make run`. [demo/onboarding.ts](demo/onboarding.ts)
 walks through an onboarding story over the public API: a registry as data, three-valued
 form requirements, certifications, history and `as_of`, the outbox, a uniqueness
-rollout with violation records, blocked deletes and soft removal.
+rollout with violation records, blocked deletes, soft removal and queries.
 
 `PORT` defaults to 8086. `DATABASE_URL` defaults to
 `postgres://localhost:5432/onb_data`. Tests use `TEST_DATABASE_URL`, defaulting
