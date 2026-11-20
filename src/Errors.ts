@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect";
 import type { Issue } from "./core/model.ts";
 const fields = { issues: Schema.Array(Schema.Struct({ field: Schema.String, issue: Schema.String })) };
+export class BadCursor extends Schema.TaggedError<BadCursor>()("BadCursor", {}) {}
 export class NotFound extends Schema.TaggedError<NotFound>()("NotFound", {}) {}
 export class Conflict extends Schema.TaggedError<Conflict>()("Conflict", fields) {}
 export class Invalid extends Schema.TaggedError<Invalid>()("Invalid", fields) {}

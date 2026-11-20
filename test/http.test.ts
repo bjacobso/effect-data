@@ -109,6 +109,7 @@ test("generic HTTP composition exposes only enabled collections, operations, and
           "attributes",
           "shapes",
           "automations",
+          "queries",
           ...(selected === "onboarding" ? ["policies"] : []),
           ...(selected === "certification" ? ["certification_requirements"] : []),
         ].sort(),

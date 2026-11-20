@@ -47,28 +47,35 @@ export function cells(sql: SqlClient.SqlClient) {
         : sql``
     }`;
 
-  const write = (account: string, entities: Iterable<{ entity: Entity; keys: Iterable<string>; deleted: boolean }>, types: CellTypes) =>
-    Effect.gen(function* () {
-      const rows: Cell[] = [];
-      const removed: Key[] = [];
-      const deleted: string[] = [];
-      for (const { entity, keys, deleted: gone } of entities) {
-        if (gone) {
-          deleted.push(entity.id);
-          continue;
-        }
-        for (const attribute of keys) {
-          const value = entity.facts[attribute];
-          if (value === undefined) removed.push({ entity_id: entity.id, attribute });
-          else rows.push(cell(entity, attribute, value, types.get(attribute)!));
-        }
+  const writePrefix = (
+    account: string,
+    entities: Iterable<{ entity: Entity; keys: Iterable<string>; deleted: boolean }>,
+    types: CellTypes,
+  ) => {
+    const rows: Cell[] = [];
+    const removed: Key[] = [];
+    const deleted: string[] = [];
+    for (const { entity, keys, deleted: gone } of entities) {
+      if (gone) {
+        deleted.push(entity.id);
+        continue;
       }
-      if (deleted.length) yield* sql`DELETE FROM cells WHERE account_id=${account} AND entity_id IN ${sql.in(deleted)}`;
-      if (removed.length)
-        yield* sql`DELETE FROM cells c USING jsonb_to_recordset(${JSON.stringify(removed)}::jsonb)
-      AS r(entity_id text,attribute text) WHERE c.account_id=${account} AND c.entity_id=r.entity_id AND c.attribute=r.attribute`;
-      if (rows.length) yield* insert(account, rows, true);
-    });
+      for (const attribute of keys) {
+        const value = entity.facts[attribute];
+        if (value === undefined) removed.push({ entity_id: entity.id, attribute });
+        else rows.push(cell(entity, attribute, value, types.get(attribute)!));
+      }
+    }
+    const changes = [];
+    if (deleted.length) changes.push(sql`DELETE FROM cells WHERE account_id=${account} AND entity_id IN ${sql.in(deleted)}`);
+    if (removed.length)
+      changes.push(sql`DELETE FROM cells c USING jsonb_to_recordset(${JSON.stringify(removed)}::jsonb)
+      AS r(entity_id text,attribute text) WHERE c.account_id=${account} AND c.entity_id=r.entity_id AND c.attribute=r.attribute`);
+    if (rows.length) changes.push(insert(account, rows, true));
+    return changes.length
+      ? sql`WITH ${sql.join(",", false)(changes.map((change, i) => sql`${sql(`cell_write_${i}`)} AS (${change})`))}`
+      : sql``;
+  };
 
   const rebuild = (account: string, types: CellTypes, attribute?: string) =>
     Effect.gen(function* () {
@@ -80,7 +87,7 @@ export function cells(sql: SqlClient.SqlClient) {
           : sql<{ id: string; document: string }>`SELECT e.id,e.document FROM (
                 SELECT entity_id FROM cells WHERE account_id=${account} AND attribute=${attribute}
                   AND entity_id>${after} ORDER BY entity_id LIMIT 2000
-              ) c JOIN entities e ON e.account_id=${account} AND e.id=c.entity_id ORDER BY c.entity_id`;
+              ) c JOIN entities e ON e.account_id=${account} AND e.id=c.entity_id COLLATE "default" ORDER BY c.entity_id`;
         if (!page.length) return;
         const rows = page.flatMap(({ document }) => {
           const entity = JSON.parse(document) as Entity;
@@ -110,5 +117,5 @@ export function cells(sql: SqlClient.SqlClient) {
     for (const { account_id, document } of registries) yield* rebuild(account_id, cellTypes((JSON.parse(document) as Registry).attributes));
   });
 
-  return { write, rebuild, backfill };
+  return { writePrefix, rebuild, backfill };
 }

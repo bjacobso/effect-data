@@ -148,6 +148,12 @@ const Automation = Schema.Struct({
   when: Schema.optionalKey(Schema.Json),
   do: Schema.Array(Action),
 });
+export const Query = Schema.Struct({
+  id: Schema.String,
+  shape: Schema.String,
+  where: Schema.optionalKey(Schema.Json),
+  order_by: Schema.Array(Schema.Struct({ attribute: Schema.String, direction: Schema.Literals(["asc", "desc"]) })),
+});
 const Requirement = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
@@ -171,6 +177,7 @@ const registryFields = {
   shapes: Schema.Array(Shape),
   policies: Schema.Array(Policy),
   automations: Schema.Array(Automation),
+  queries: Schema.Array(Query),
 };
 export const Registry = Schema.StructWithRest(Schema.Struct(registryFields), [Schema.Record(Schema.String, Schema.Json)]);
 export const CertRegistry = Schema.Struct({ ...registryFields, certification_requirements: Schema.Array(Requirement) });

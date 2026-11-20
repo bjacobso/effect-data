@@ -100,10 +100,10 @@ const AUTOMATIONS = [
   },
   { id: "salary-watch", shape: "employee", on: { changed: ["employee/salary"] }, do: [{ op: "notify", message: "salary changed" }] },
 ];
-const REGISTRY = { attributes: ATTRS, shapes: [EMPLOYEE, CONTRACTOR], policies: POLICIES, automations: AUTOMATIONS };
+const REGISTRY = { attributes: ATTRS, shapes: [EMPLOYEE, CONTRACTOR], policies: POLICIES, automations: AUTOMATIONS, queries: [] };
 
 // Other enabled packs may add collections; they must be empty arrays here and are otherwise ignored.
-const CORE_KEYS = ["version", "attributes", "shapes", "policies", "automations"];
+const CORE_KEYS = ["version", "attributes", "shapes", "policies", "automations", "queries"];
 const known = Effect.fnUntraced(function* (doc: typeof Registry.Type, ctx: string) {
   for (const [k, v] of Object.entries(doc ?? {}))
     if (!CORE_KEYS.includes(k) && k !== "rollout")
@@ -161,7 +161,7 @@ test(
     yield* eqJ(r.status, 200, "GET empty registry");
     yield* same(
       yield* known(yield* r.body, "empty"),
-      { version: 0, attributes: [], shapes: [], policies: [], automations: [] },
+      { version: 0, attributes: [], shapes: [], policies: [], automations: [], queries: [] },
       "empty registry",
     );
   }),

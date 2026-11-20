@@ -1,7 +1,7 @@
 import { Context, Effect, Layer, Schema, SchemaIssue, Cause, Option, ByteSize } from "effect";
 import { HttpApiMiddleware, HttpApiSchema } from "effect/http-api";
 import { HttpRouter, HttpServerRequest, HttpServerResponse, HttpServerError } from "effect/http";
-import { NotFound, Conflict, Invalid } from "../Errors.ts";
+import { BadCursor, NotFound, Conflict, Invalid } from "../Errors.ts";
 import { issue, path, type Issue } from "../core/model.ts";
 export const ErrorEnvelope = Schema.Struct({
   error: Schema.Struct({
@@ -17,13 +17,15 @@ export function respond<A, E, R>(effect: Effect.Effect<A, E, R>) {
   return effect.pipe(
     Effect.catch((e) =>
       Effect.succeed(
-        e instanceof NotFound
-          ? errorResponse(404, "not_found")
-          : e instanceof Conflict
-            ? errorResponse(409, "conflict", e.issues)
-            : e instanceof Invalid
-              ? errorResponse(422, "validation_failed", e.issues)
-              : errorResponse(500, "internal"),
+        e instanceof BadCursor
+          ? errorResponse(400, "bad_request", [issue("after", "Invalid query cursor")])
+          : e instanceof NotFound
+            ? errorResponse(404, "not_found")
+            : e instanceof Conflict
+              ? errorResponse(409, "conflict", e.issues)
+              : e instanceof Invalid
+                ? errorResponse(422, "validation_failed", e.issues)
+                : errorResponse(500, "internal"),
       ),
     ),
   );

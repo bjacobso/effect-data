@@ -110,7 +110,7 @@ test(
     const r2 = yield* putOk(a, 1, REGISTRY);
     yield* same(
       yield* (yield* req(CertRegistry, "GET", "/v2/registry", { account: a })).body,
-      { version: 2, ...REGISTRY, rollout: { version: 2, status: "done", processed: 0, total: 0 } },
+      { version: 2, ...REGISTRY, queries: [], rollout: { version: 2, status: "done", processed: 0, total: 0 } },
       "full round-trip",
     );
     yield* eqJ(r2.version, 2, "version");

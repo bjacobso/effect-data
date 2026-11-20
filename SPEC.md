@@ -10,7 +10,7 @@ the behaviour it describes.
   and this file must be brought back into agreement; PLAN.md is not edited
   after its pass lands.
 
-Status: through **Pass 6**, with the Pass 7 typed cell projection. Packs: `onboarding`,
+Status: through **Pass 7** (live queries). Packs: `onboarding`,
 `certification`.
 
 ## 1. Model
@@ -31,9 +31,9 @@ Status: through **Pass 6**, with the Pass 7 typed cell projection. Packs: `onboa
 
 ### 2.1 Document
 
-`{ attributes, shapes, automations, <pack collections…> }`, ordered by kind
+`{ attributes, shapes, automations, queries, <pack collections…> }`, ordered by kind
 order: attributes (10), shapes (20), policies (30, onboarding),
-certification_requirements (35, certification), automations (40).
+certification_requirements (35, certification), automations (40), queries (45).
 
 - Every enabled collection is optional on input (absent = `[]`) and always
   present on output. A collection of a disabled pack is an unknown property.
@@ -82,6 +82,13 @@ unique keys that must be in `attributes`. A `clear` ref may not be `required`
 shape; `when` a rule; `do` 1–10 actions. Core action:
 `{ op: "set", attribute, value }` where `value` must decode as the attribute
 and `null` (retract) is not allowed for a required attribute.
+
+**Query** `{ id, shape, where?, order_by }`: `id` uses the usual id pattern
+and `shape` must resolve. `where` is a typed rule (absent = T). Its facts
+must be active attributes of the shape. `order_by` is a list of 0–3
+`{ attribute, direction }` items. Each attribute is distinct and active
+on the shape, with a type other than ref or boolean. Direction is
+`asc | desc`. Query issues are ordered by `id, shape, where, order_by`.
 
 ### 2.3 Pack kinds and operations
 
@@ -163,6 +170,10 @@ comparisons are normative in
 effect-data specifics:
 
 - `fact` is always an attribute key of the document's shape.
+- Case-insensitive string and enum comparisons use JavaScript
+  `String.prototype.toLowerCase()` on both operands. Cells store the folded
+  value when it differs, so SQL uses the same Unicode casing as rule
+  evaluation, independent of database locale.
 - Conditions on `ref` attributes allow only `equal`, `notEqual`, `in`,
   `notIn`, `exists`, `doesNotExist`; operands must be entity ids;
   `ignore_case` is not allowed. Operands are not checked for liveness. Rules
@@ -300,6 +311,27 @@ restored dangling ref blocks a strict apply or becomes a rollout violation.
   otherwise `valid`. `expires` and `renew_by` are present whenever the expiry
   fact exists.
 
+### 7.1 Core query routes
+
+- `POST /v2/queries/{id}/run` runs a stored query and returns 404 for an
+  unknown id. `POST /v2/query` takes an inline document at `query`, checked
+  against the current registry with the same kind schema and checks.
+  Invalid inline documents return 422 with paths prefixed by `query`.
+- Both routes take a JSON object with optional `limit` (an integer from
+  1 to 200, default 50), `after` (the returned cursor), and `match`
+  (`"true"` by default, or `"unknown"`). These select T and U respectively.
+  F is excluded. Results are `{ data: [entity], next_after }`, with the
+  same entity documents as live GET, including open violations.
+- Order follows `order_by` and then entity id ascending. Missing values
+  sort last in both directions. Present values sort by type, using
+  case-sensitive code point order for strings. `next_after` is null when
+  the page has no further results. Invalid cursors and cursors bound to
+  another account, query, registry version, route or match return 400.
+  Limit may change between pages.
+- A page reads one committed snapshot of the registry, entities, cells and
+  violations. Separate pages can see different entity writes and rollout
+  progress. Queries read live data.
+
 ## 8. HTTP
 
 | Method | Path | Notes |
@@ -316,6 +348,8 @@ restored dangling ref blocks a strict apply or becomes a rollout violation.
 | GET | `/v2/entities/{id}/referrers` | |
 | GET | `/v2/outbox` | |
 | GET | `/v2/violations` | |
+| POST | `/v2/queries/{id}/run` | stored query |
+| POST | `/v2/query` | inline query |
 | POST | `/v2/entities/{id}/evaluate` | onboarding pack |
 | POST | `/v2/entities/{id}/certifications` | certification pack |
 
@@ -334,16 +368,23 @@ restored dangling ref blocks a strict apply or becomes a rollout violation.
   the same transaction as the facts. Registry rollouts reconcile the
   uniqueness projection and violation records in background transactions.
 - `cells` projects the stored facts of live entities, including hidden
-  values, in the same transaction as entity writes. A missing fact has no
+  values, alongside the entity projection in the same write transaction. A missing fact has no
   row. Each cell stores one value in a text (`C` collation), numeric,
   boolean or date column according to the current attribute type. A flagged
   text cell holds JSON for strings with a NUL or a lone surrogate and for
   hidden legacy values that cannot be represented in the current column.
-  The value contract and historical facts are unchanged.
+  The value contract and historical facts are unchanged. A query that
+  compares or orders flagged text in its shape, or has an operand PostgreSQL
+  cannot represent, evaluates and sorts through JavaScript on the page
+  snapshot. Exceptionally wide rules also use this path to bound SQL size.
+  These queries can require a shape scan.
 - Migration backfills live cells from stored entity documents. Registry
   type changes rebuild affected cells under the exclusive account lock.
   Membership changes leave cells untouched. Typed indexes include account,
   attribute, typed value (a bounded prefix for text), and entity id.
+  Text comparisons check the full value after any prefix index lookup.
+  For attribute names over 768 bytes, queries use the attribute index and
+  evaluate the value separately.
 - Registry versions are recorded on apply. The registry-history migration
   captures the current document for existing accounts at backfill time.
 - `live_refs` projects stored ref facts, including hidden values, using the
@@ -374,5 +415,5 @@ another.
 
 ## 11. Not yet specified
 
-- Queries (deferred; effect-data stays standalone from Triplex).
+- Historical queries and queries following refs.
 - Purge of hidden facts and rolling out blocking schema changes.
